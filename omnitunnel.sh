@@ -20,7 +20,7 @@
 # /etc/icmptun install (this tool never reads, edits or deletes that).
 set -euo pipefail
 
-VERSION="2.9.1"
+VERSION="2.9.2"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 
@@ -46,6 +46,7 @@ CHISEL_VER="1.10.1"
 ASSET_DIR="${OMNITUN_ASSETS:-/opt/omnitunnel}"
 RAW_BASE="https://raw.githubusercontent.com/Free-Guy-IR/OmniTunnel/main"
 
+# shellcheck disable=SC2034
 C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'; C_ITAL=$'\033[3m'
 C_GREEN=$'\033[32m'; C_RED=$'\033[31m'; C_YELLOW=$'\033[33m'; C_CYAN=$'\033[36m'
 C_BLUE=$'\033[34m'; C_MAG=$'\033[35m'; C_WHITE=$'\033[97m'; C_GREY=$'\033[90m'
@@ -62,6 +63,55 @@ warn() { printf '%b!%b %s\n' "$C_BYEL$C_BOLD" "$C_RESET" "$*"; }
 pause() { printf '\n  %bPress Enter to continue...%b' "$C_GREY" "$C_RESET"; read -r _ || true; }
 
 arch_tag() { case "$(uname -m)" in x86_64|amd64) echo amd64;; aarch64|arm64) echo arm64;; *) echo unknown;; esac; }
+
+pick_num() {
+    local v="${1:-}" max="${2:-0}"
+    [[ "$v" =~ ^[0-9]+$ ]] || return 1
+    [[ ${#v} -le 6 ]] || return 1
+    v=$((10#$v))
+    [[ "$v" -ge 1 && "$v" -le "$max" ]] || return 1
+    printf '%s' "$v"
+}
+
+norm_port() {
+    local v="${1:-}"
+    [[ "$v" =~ ^[0-9]{1,5}$ ]] || return 1
+    v=$((10#$v))
+    [[ "$v" -ge 1 && "$v" -le 65535 ]] || return 1
+    printf '%s' "$v"
+}
+
+validate_inst_name() {
+    local n="${1:-}" other
+    [[ -n "$n" ]] || die "instance name cannot be empty"
+    [[ "$n" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$ ]] || die "instance name must start alphanumeric and contain only letters, digits, - or _ (got '$n')"
+    for other in $(list_instances); do
+        [[ "$other" == "$n" ]] && continue
+        case "$n" in
+            "$other"-mux|"$other"-pf-*)
+                die "name '$n' would collide with a helper unit of instance '$other' - pick another name";;
+        esac
+        case "$other" in
+            "$n"-mux|"$n"-pf-*)
+                die "instance '$other' already exists and collides with this one's helper units - remove or rename it first";;
+        esac
+    done
+    return 0
+}
+
+rewrite_without() {
+    local file="$1" pat="$2" t rc
+    if [[ -e "$file" || -L "$file" ]]; then
+        [[ -f "$file" ]] || return 2
+    else
+        return 0
+    fi
+    t="$(mktemp "$file.XXXXXX" 2>/dev/null)" || return 2
+    rc=0; grep -v "$pat" "$file" > "$t" 2>/dev/null || rc=$?
+    [[ "$rc" -le 1 ]] || { rm -f "$t"; return 2; }
+    mv "$t" "$file" || { rm -f "$t"; return 2; }
+    return 0
+}
 
 # make sure /usr/local/bin/omnitun exists and matches this CPU
 ensure_binary() {
@@ -175,7 +225,8 @@ create_inst() {
     # reverse-mux IS icmp with the reply-type forced (its whole point is the
     # reply-gated dodge), so default its ICMP_MODE to reply if unset.
     [[ "$t" == reverse-mux && -z "$imode" ]] && imode=reply
-    local dev="ts-$n"; [[ ${#dev} -gt 15 ]] && dev="ts$(echo "$n" | cksum | cut -c1-8)"
+    validate_inst_name "$n"
+    local dev="ts-$n"; [[ ${#dev} -gt 15 ]] && dev="ts$(printf '%s' "$n" | cksum | tr -dc '0-9' | cut -c1-8)"
     mkdir -p "$(inst_path "$n")"; : > "$(inst_pf "$n")"
     cat > "$(inst_conf "$n")" <<EOF
 TYPE=$t
@@ -379,7 +430,7 @@ hy_reconcile_relays() {
     local f base port u
     for f in /etc/systemd/system/omnitun-"$1"-pf-*.service; do
         [[ -e "$f" ]] || continue
-        base="$(basename "$f")"; port="${base#omnitun-$1-pf-}"; port="${port%.service}"
+        base="$(basename "$f")"; port="${base#"omnitun-$1-pf-"}"; port="${port%.service}"
         if ! printf '%s\n' "${want[@]:-}" | grep -qx "$port"; then
             systemctl disable --now "$base" >/dev/null 2>&1 || true; rm -f "$f"; changed=1
         fi
@@ -575,7 +626,7 @@ inst_status() {
     load_inst "$1"
     local running=0; inst_running "$1" && running=1
     local dot col ncol="$C_BOLD$C_WHITE"
-    if [[ $running == 1 ]]; then dot="$G_DOT_ON"; col="$C_BGRN"; else dot="$G_DOT_ON"; col="$C_BRED"; fi
+    if [[ $running == 1 ]]; then dot="$G_DOT_ON"; col="$C_BGRN"; else dot="$G_DOT_OFF"; col="$C_BRED"; fi
     local peer="$PEER_IP"; [[ -n "$PORT" && "$TYPE" != icmp ]] && peer="$PEER_IP:$PORT"
     local rtt="-" loss="-" rc="$C_WHITE" lc="$C_BGRN"
     if [[ $running == 1 ]]; then
@@ -658,21 +709,24 @@ pf_add() {
     need_root; load_inst "$1"; local proto="$2" ports="$3"
     [[ "$proto" =~ ^(tcp|udp|both)$ ]] || die "proto must be tcp|udp|both"
     # accept several ports at once, comma-separated: pf-add <inst> tcp 8080,8081,700
-    local pf pr p; pf="$(inst_pf "$1")"
+    local pf pr p np rc; pf="$(inst_pf "$1")"
     for p in ${ports//,/ }; do
-        [[ "$p" =~ ^[0-9]+$ ]] || { warn "skipping invalid port '$p'"; continue; }
+        np="$(norm_port "$p")" || { warn "skipping invalid port '$p'"; continue; }
+        [[ -e "$pf" ]] || : > "$pf"
         for pr in $([[ "$proto" == both ]] && echo "tcp udp" || echo "$proto"); do
-            grep -qx "$pr:$p" "$pf" 2>/dev/null || echo "$pr:$p" >> "$pf"; done
+            rc=0; grep -qx "$pr:$np" "$pf" 2>/dev/null || rc=$?
+            [[ "$rc" -le 1 ]] || die "could not read $pf (grep exit $rc) - nothing added"
+            [[ "$rc" -eq 0 ]] || echo "$pr:$np" >> "$pf"; done
     done
     pf_apply_all "$1"; ok "forwarding $proto/$ports through '$1' to $PEER_ADDR"
 }
 pf_del() {
-    need_root; load_inst "$1"; local ports="$2" pf p; pf="$(inst_pf "$1")"
+    need_root; load_inst "$1"; local ports="$2" pf p np; pf="$(inst_pf "$1")"
     # accept several ports at once, comma-separated: pf-del <inst> 8080,8081
     if [[ -f "$pf" ]]; then
         for p in ${ports//,/ }; do
-            [[ "$p" =~ ^[0-9]+$ ]] || continue
-            grep -v ":$p\$" "$pf" > "$pf.t" 2>/dev/null && mv "$pf.t" "$pf" || rm -f "$pf.t"
+            np="$(norm_port "$p")" || { warn "skipping invalid port '$p'"; continue; }
+            rewrite_without "$pf" ":0*$np\$" || die "could not rewrite $pf - nothing removed"
         done
     fi
     pf_apply_all "$1"; ok "removed forward(s) on port(s) $ports from '$1'"
@@ -699,7 +753,7 @@ mux_conf() { echo "$INST_DIR/$1/mux.conf"; }        # lines: <pub_port>:<dest_ho
 mux_svc()  { echo "omnitun-$1-mux.service"; }
 # deterministic control port from the instance subnet (10.201.<X>.y -> 9000+X);
 # bound to the tun IP so it is reachable only through the tunnel, never publicly.
-mux_ctrl_port() { load_inst "$1"; local x; x=$(echo "$TUN_ADDR" | grep -oE '10\.201\.[0-9]+' | grep -oE '[0-9]+$'); echo $(( 9000 + ${x:-0} )); }
+mux_ctrl_port() { load_inst "$1"; local x; x=$(echo "$TUN_ADDR" | grep -oE '10\.201\.[0-9]+' | grep -oE '[0-9]+$' || true); [[ "$x" =~ ^[0-9]+$ ]] || x=0; echo $(( 9000 + x )); }
 # base64 token carrying the relay tun IP + ctrl port + the full mapping set, for
 # the no-SSH path (paste on the foreign). Rebuilt from mux.conf each call.
 mux_token() {
@@ -802,12 +856,19 @@ _mux_push_foreign() {
 cmd_mux_add() {
     need_root; local inst="$1" pub="$2" dh="$3" dp="$4"
     inst_exists "$inst" || die "no such instance: $inst"
-    [[ "$pub" =~ ^[0-9]+$ && "$dp" =~ ^[0-9]+$ && -n "$dh" ]] || die "usage: mux-add <inst> <public_port> <dest_host> <dest_port>"
+    pub="$(norm_port "$pub")" || die "public port must be 1-65535"
+    dp="$(norm_port "$dp")" || die "destination port must be 1-65535"
+    [[ -n "$dh" ]] || die "usage: mux-add <inst> <public_port> <dest_host> <dest_port>"
     load_inst "$inst"
     [[ "$ROLE" == server ]] && die "run mux-add on the RELAY (client) side of '$inst', not the foreign"
-    local mc; mc="$(mux_conf "$inst")"
-    { grep -vE "^$pub:" "$mc" 2>/dev/null || true; } > "$mc.t"; mv "$mc.t" "$mc"
-    echo "$pub:$dh:$dp" >> "$mc"
+    local mc t rc; mc="$(mux_conf "$inst")"
+    [[ ! -e "$mc" || -f "$mc" ]] || die "$mc is not a regular file"
+    t="$(mktemp "$mc.XXXXXX" 2>/dev/null)" || die "cannot create a temp file next to $mc"
+    rc=0
+    if [[ -f "$mc" ]]; then grep -v "^0*$pub:" "$mc" > "$t" 2>/dev/null || rc=$?; fi
+    [[ "$rc" -le 1 ]] || { rm -f "$t"; die "could not read $mc (grep exit $rc) - nothing changed"; }
+    printf '%s:%s:%s\n' "$pub" "$dh" "$dp" >> "$t" || { rm -f "$t"; die "could not write $t - nothing changed"; }
+    mv "$t" "$mc" || { rm -f "$t"; die "could not replace $mc - nothing changed"; }
     mux_relay_reconcile "$inst"
     ok "relay: public $pub muxed over '$inst' -> foreign $dh:$dp (one flow)"
     _mux_push_foreign "$inst" "$PEER_IP"
@@ -816,9 +877,10 @@ cmd_mux_add() {
 cmd_mux_del() {
     need_root; local inst="$1" pub="$2"
     inst_exists "$inst" || die "no such instance: $inst"
+    pub="$(norm_port "$pub")" || die "usage: mux-del <inst> <public_port>"
     load_inst "$inst"
     local mc; mc="$(mux_conf "$inst")"
-    [[ -f "$mc" ]] && { { grep -vE "^$pub:" "$mc" 2>/dev/null || true; } > "$mc.t"; mv "$mc.t" "$mc"; }
+    rewrite_without "$mc" "^0*$pub:" || die "could not rewrite $mc - nothing removed"
     mux_relay_reconcile "$inst"
     ok "removed muxed forward $pub from '$inst'"
     if [[ -s "$mc" ]]; then _mux_push_foreign "$inst" "$PEER_IP"
@@ -1087,8 +1149,11 @@ cmd_add_auto() {
     local sub port key ta pa; sub=$(alloc_subnet "$fsub"); ta="10.201.$sub.1"; pa="10.201.$sub.2"
     port=$(alloc_port "$(( $(port_base "$t") + sub ))" "$fport"); key=$(gen_key); type_uses_key "$t" || key=""
     local imode="${OMNITUN_ICMP_MODE:-}" pmode="${OMNITUN_ICMP_MODE_PEER:-}"
-    for m in "$imode" "$pmode"; do [[ -z "$m" || "$m" == reply || "$m" == request ]] || die "icmp mode must be reply|request (got '$m')"; done
-    [[ "$t" == icmp ]] || { imode=""; pmode=""; }
+    local m; for m in "$imode" "$pmode"; do [[ -z "$m" || "$m" == reply || "$m" == request ]] || die "icmp mode must be reply|request (got '$m')"; done
+    [[ "$t" == icmp ]] || type_is_revmux "$t" || { imode=""; pmode=""; }
+    if type_is_revmux "$t" && [[ "$imode" == request || "$pmode" == request ]]; then
+        warn "reverse-mux asked to emit echo-request; that gives up its reply-gated dodge"
+    fi
     provision_peer "$fhost" "$kn" "$t" "$fhost" "$mylip" "$port" "$key" "$pa" "$ta" "$shape" "$nc" "$pmode"
     create_inst "$kn" "$t" client "$mylip" "$fhost" "$port" "$key" "$ta" "$pa" "$shape" "$nc" "$imode"
     inst_enable "$kn"; ok "instance '$kn' ($t) up: $mylip -> $fhost  (subnet 10.201.$sub.0/24, port/key $port)"
@@ -1112,8 +1177,11 @@ cmd_add_manual() {
     # icmp: this end's emitted ICMP type (OMNITUN_ICMP_MODE) and the foreign end's
     # (OMNITUN_ICMP_MODE_PEER), for paths that drop one echo type in one direction.
     local imode="${OMNITUN_ICMP_MODE:-}" pmode="${OMNITUN_ICMP_MODE_PEER:-}"
-    for m in "$imode" "$pmode"; do [[ -z "$m" || "$m" == reply || "$m" == request ]] || die "icmp mode must be reply|request (got '$m')"; done
-    [[ "$t" == icmp ]] || { imode=""; pmode=""; }
+    local m; for m in "$imode" "$pmode"; do [[ -z "$m" || "$m" == reply || "$m" == request ]] || die "icmp mode must be reply|request (got '$m')"; done
+    [[ "$t" == icmp ]] || type_is_revmux "$t" || { imode=""; pmode=""; }
+    if type_is_revmux "$t" && [[ "$imode" == request || "$pmode" == request ]]; then
+        warn "reverse-mux asked to emit echo-request; that gives up its reply-gated dodge"
+    fi
     create_inst "$kn" "$t" client "$mylip" "$fhost" "$port" "$key" "$ta" "$pa" "$shape" "$nc" "$imode"
     inst_enable "$kn"
     # Server-side params (tun IPs swapped). Encoded so it is a single paste.
@@ -1156,9 +1224,11 @@ cmd_server_token() {
 wizard_add() {
     need_root; ensure_binary
     echo; echo "${C_BOLD}Add a tunnel  (this box = near side / client; far = foreign / server)${C_RESET}"
-    local ci=1 types=() t
-    for t in $ALL_TYPES; do printf "  %d) %-5s %s\n" "$ci" "$t" "$(type_desc "$t")"; types+=("$t"); ci=$((ci+1)); done
-    read -erp "Tunnel type [1]: " ch; ch="${ch:-1}"; t="${types[$((ch-1))]:-}"; [[ -z "$t" ]] && { warn "invalid"; return; }
+    local ci=1 types=() t ch x fhost fu fp fpx kn
+    for t in $ALL_TYPES; do printf "  %2d) %-12s %s\n" "$ci" "$t" "$(type_desc "$t")"; types+=("$t"); ci=$((ci+1)); done
+    read -erp "Tunnel type [1]: " ch; ch="${ch:-1}"
+    ch="$(pick_num "$ch" "${#types[@]}")" || { warn "pick a number between 1 and ${#types[@]}"; return; }
+    t="${types[$((ch-1))]}"
     local mylip; mylip="$(default_local_ip)"
     read -erp "This box public IP [$mylip]: " x; mylip="${x:-$mylip}"
     read -erp "Far (foreign) server IP: " fhost; [[ -z "$fhost" ]] && { warn "need a foreign IP"; return; }
@@ -1182,7 +1252,7 @@ wizard_add() {
     fnames=$(peer_ssh "$fhost" "ls /etc/omnitunnel/inst 2>/dev/null" 2>/dev/null | tr '\r\n' '  ' || true)
     case " $fnames " in *" $kn "*) warn "the foreign already has an instance named '$kn' - pick a different name"; return;; esac
     local sub port key ta pa; sub=$(alloc_subnet "$fsub"); ta="10.201.$sub.1"; pa="10.201.$sub.2"
-    port=$(alloc_port "$(( $(port_base "$t") + sub ))" "$fport"); key=$(gen_key)
+    port=$(alloc_port "$(( $(port_base "$t") + sub ))" "$fport"); key=$(gen_key); type_uses_key "$t" || key=""
     provision_peer "$fhost" "$kn" "$t" "$fhost" "$mylip" "$port" "$key" "$pa" "$ta" "$shape" "$nc"
     create_inst "$kn" "$t" client "$mylip" "$fhost" "$port" "$key" "$ta" "$pa" "$shape" "$nc"
     inst_enable "$kn"; ok "instance '$kn' ($t) is up on both sides.  (subnet 10.201.$sub.0/24, port/key $port)"
@@ -1203,9 +1273,11 @@ wizard_add() {
 wizard_add_manual() {
     need_root; ensure_binary
     echo; echo "${C_BOLD}Add a tunnel - MANUAL${C_RESET} ${C_DIM}(no SSH to the foreign; nothing touches port 22)${C_RESET}"
-    local ci=1 types=() t
-    for t in $ALL_TYPES; do printf "  %d) %-5s %s\n" "$ci" "$t" "$(type_desc "$t")"; types+=("$t"); ci=$((ci+1)); done
-    read -erp "Tunnel type [2]: " ch; ch="${ch:-2}"; t="${types[$((ch-1))]:-}"; [[ -z "$t" ]] && { warn "invalid"; return; }
+    local ci=1 types=() t ch x fhost kn
+    for t in $ALL_TYPES; do printf "  %2d) %-12s %s\n" "$ci" "$t" "$(type_desc "$t")"; types+=("$t"); ci=$((ci+1)); done
+    read -erp "Tunnel type [2]: " ch; ch="${ch:-2}"
+    ch="$(pick_num "$ch" "${#types[@]}")" || { warn "pick a number between 1 and ${#types[@]}"; return; }
+    t="${types[$((ch-1))]}"
     local mylip; mylip="$(default_local_ip)"
     read -erp "This box public IP [$mylip]: " x; mylip="${x:-$mylip}"
     read -erp "Far (foreign) server IP: " fhost; [[ -z "$fhost" ]] && { warn "need a foreign IP"; return; }
@@ -1295,7 +1367,8 @@ bench_run() {
     # deploy core + iperf3 server on the far side
     local parch; parch=$(peer_ssh "$fhost" "uname -m" 2>/dev/null | tr -d '\r')
     case "$parch" in x86_64|amd64) parch=amd64;; aarch64|arm64) parch=arm64;; *) die "peer CPU $parch unsupported";; esac
-    local pbin=""; for d in "$ASSET_DIR/bin" "$SCRIPT_DIR/bin"; do [[ -f "$d/omnitun-$parch" ]] && pbin="$d/omnitun-$parch"; done
+    local pbin=""; for d in "$ASSET_DIR/bin" "$SCRIPT_DIR/bin"; do [[ -f "$d/omnitun-$parch" ]] && { pbin="$d/omnitun-$parch"; break; }; done
+    [[ -n "$pbin" ]] || die "no omnitun-$parch binary to send to $fhost (looked in $ASSET_DIR/bin and $SCRIPT_DIR/bin)"
     info "Deploying suite to $fhost ($parch)..."
     peer_ssh "$fhost" "mkdir -p /opt/omnitunnel/bin" || die "cannot reach $fhost"
     peer_scp "$fhost" "$pbin" "/opt/omnitunnel/bin/omnitun-$parch"
@@ -1432,10 +1505,14 @@ bench_run() {
     printf '  %bevery test tunnel was removed from both sides.%b\n\n' "$C_GREY" "$C_RESET"
     rule_green
     printf '  %bKeep one as a permanent instance?%b ' "$C_BGRN" "$C_RESET"
-    local ci=1; for t in $ALL_TYPES; do printf "  %d) %-5s %s\n" "$ci" "$t" "$(type_desc "$t")"; ci=$((ci+1)); done
-    echo "  0) keep none"
-    read -erp "Choice: " ch || true; [[ "$ch" == 0 || -z "$ch" ]] && { info "nothing kept."; return 0; }
-    local keep; keep=$(echo $ALL_TYPES | cut -d' ' -f"$ch"); [[ -z "$keep" ]] && { warn "invalid"; return; }
+    local ci=1 ch keep; for t in $ALL_TYPES; do printf "  %2d) %-12s %s\n" "$ci" "$t" "$(type_desc "$t")"; ci=$((ci+1)); done
+    echo "   0) keep none"
+    read -erp "Choice: " ch || true; [[ -z "$ch" ]] && { info "nothing kept."; return 0; }
+    [[ "$ch" =~ ^[0-9]+$ ]] || { warn "pick a number"; return; }
+    [[ "$ch" =~ ^0+$ ]] && { info "nothing kept."; return 0; }
+    local tarr=(); read -r -a tarr <<< "$ALL_TYPES"
+    ch="$(pick_num "$ch" "${#tarr[@]}")" || { warn "no transport numbered $ch"; return; }
+    keep="${tarr[$((ch-1))]}"
     read -erp "Name for the kept instance [main]: " kn; kn="${kn:-main}"; inst_exists "$kn" && die "instance $kn exists"
     local nc=16 shape=none
     [[ "$keep" == mux ]] && { read -erp "mux links N [16]: " nc; nc="${nc:-16}"; read -erp "download shaper (e.g. 90mbit / none) [none]: " shape; shape="${shape:-none}"; }
@@ -1481,7 +1558,7 @@ cmd_bench_manual() {
     local rows=() i=0 t
     set +e   # best-effort measurement (see bench_run): never abort mid-run
     for t in $ALL_TYPES; do
-        type_is_hysteria "$t" && { i=$((i+1)); continue; }  # manual bench (fixed keys) skips hysteria; use auto bench for it
+        { type_is_hysteria "$t" || type_is_revmux "$t"; } && { i=$((i+1)); continue; }  # manual bench (fixed keys) skips hysteria; use auto bench for it
         local name="bench-$t" sub=$((100+i)) port=$((51900+i)) key; key=$(_bench_key_for "$t")
         local ta="10.201.$sub.1" pa="10.201.$sub.2"
         echo -n "  $t ... "
@@ -1503,10 +1580,22 @@ cmd_bench_manual() {
     echo
     rule_green
     printf '  %bKeep one as a permanent instance?%b %b(sets up its own fresh token)%b ' "$C_BGRN" "$C_RESET" "$C_GREY" "$C_RESET"
-    local ci=1; for t in $ALL_TYPES; do printf "  %d) %-5s %s\n" "$ci" "$t" "$(type_desc "$t")"; ci=$((ci+1)); done
-    echo "  0) keep none"
-    read -erp "Choice: " ch || true; [[ "$ch" == 0 || -z "$ch" ]] && { info "nothing kept."; return 0; }
-    local keep; keep=$(echo $ALL_TYPES | cut -d' ' -f"$ch"); [[ -z "$keep" ]] && { warn "invalid"; return; }
+    local ci=1 ch keep
+    for t in $ALL_TYPES; do
+        if type_is_hysteria "$t" || type_is_revmux "$t"; then
+            printf "  %2d) %-12s %s\n" "$ci" "$t" "not measured above - use the SSH benchmark for it"
+        else
+            printf "  %2d) %-12s %s\n" "$ci" "$t" "$(type_desc "$t")"
+        fi
+        ci=$((ci+1))
+    done
+    echo "   0) keep none"
+    read -erp "Choice: " ch || true; [[ -z "$ch" ]] && { info "nothing kept."; return 0; }
+    [[ "$ch" =~ ^[0-9]+$ ]] || { warn "pick a number"; return; }
+    [[ "$ch" =~ ^0+$ ]] && { info "nothing kept."; return 0; }
+    local tarr=(); read -r -a tarr <<< "$ALL_TYPES"
+    ch="$(pick_num "$ch" "${#tarr[@]}")" || { warn "no transport numbered $ch"; return; }
+    keep="${tarr[$((ch-1))]}"
     read -erp "Name for the kept instance [main]: " kn; kn="${kn:-main}"
     local nc=16 shape=none
     [[ "$keep" == mux ]] && { read -erp "mux links N [16]: " nc; nc="${nc:-16}"; read -erp "download shaper (e.g. 90mbit / none) [none]: " shape; shape="${shape:-none}"; }
@@ -1525,7 +1614,7 @@ cmd_bench_server() {
     local i=0 t
     set +e   # best-effort bring-up: don't abort if one type fails to come up
     for t in $ALL_TYPES; do
-        type_is_hysteria "$t" && { i=$((i+1)); continue; }  # manual bench skips hysteria (fixed-key token path)
+        { type_is_hysteria "$t" || type_is_revmux "$t"; } && { i=$((i+1)); continue; }  # manual bench skips hysteria (fixed-key token path)
         local name="bench-$t" sub=$((100+i)) port=$((51900+i)) key; key=$(_bench_key_for "$t")
         local ta="10.201.$sub.1" pa="10.201.$sub.2"
         inst_exists "$name" && inst_remove "$name" >/dev/null 2>&1
@@ -1645,9 +1734,9 @@ pick_instance() {
     printf '   %b0%b. cancel\n  %b❯%b ' "$C_DIM" "$C_RESET" "$C_BCYN$C_BOLD" "$C_RESET"
     local ch; read -r ch || true
     [[ "$ch" =~ ^[0-9]+$ ]] || { warn "please enter a number"; return 1; }
-    [[ "$ch" == 0 ]] && return 1
-    PICK="${names[$((ch-1))]:-}"
-    [[ -n "$PICK" ]] || { warn "no tunnel numbered $ch"; return 1; }
+    [[ "$ch" =~ ^0+$ ]] && return 1
+    ch="$(pick_num "$ch" "${#names[@]}")" || { warn "no tunnel numbered $ch"; return 1; }
+    PICK="${names[$((ch-1))]}"
     return 0
 }
 # Choose the forward protocol by number. Sets PROTO to tcp / udp / both.
@@ -1662,19 +1751,24 @@ pick_proto() {
 }
 # List instance $1's forwarded ports by number; set PORT_PICK to the chosen one.
 pick_fwd_port() {
-    PORT_PICK=""; local pf p ports=() seen=" " i=1 x ch
-    pf="$(inst_pf "$1")"
+    PORT_PICK=""; PORT_KIND=""; local pf mc p dh dp ports=() kinds=() labels=() seen=" " i=1 x ch
+    pf="$(inst_pf "$1")"; mc="$(mux_conf "$1")"
     if [[ -s "$pf" ]]; then
-        while IFS=: read -r _ p; do [[ -z "$p" || "$seen" == *" $p "* ]] && continue; seen+="$p "; ports+=("$p"); done < "$pf"
+        while IFS=: read -r _ p; do [[ -z "$p" || "$seen" == *" $p "* ]] && continue
+            seen+="$p "; ports+=("$p"); kinds+=(pf); labels+=("port $p"); done < "$pf"
+    fi
+    if [[ -s "$mc" ]]; then
+        while IFS=: read -r p dh dp; do [[ -z "$p" ]] && continue
+            ports+=("$p"); kinds+=(mux); labels+=("port $p  (muxed -> $dh:$dp)"); done < "$mc"
     fi
     [[ ${#ports[@]} -eq 0 ]] && { warn "this tunnel has no forwards"; return 1; }
     printf '  %bwhich forward to remove:%b\n' "$C_DIM" "$C_RESET"
-    for x in "${ports[@]}"; do printf '   %b%d%b. port %s\n' "$C_BCYN$C_BOLD" "$i" "$C_RESET" "$x"; i=$((i+1)); done
+    for x in "${labels[@]}"; do printf '   %b%d%b. %s\n' "$C_BCYN$C_BOLD" "$i" "$C_RESET" "$x"; i=$((i+1)); done
     printf '   %b0%b. cancel\n  %b❯%b ' "$C_DIM" "$C_RESET" "$C_BCYN$C_BOLD" "$C_RESET"; read -r ch || true
     [[ "$ch" =~ ^[0-9]+$ ]] || { warn "enter a number"; return 1; }
-    [[ "$ch" == 0 ]] && return 1
-    PORT_PICK="${ports[$((ch-1))]:-}"
-    [[ -n "$PORT_PICK" ]] || { warn "no forward numbered $ch"; return 1; }
+    [[ "$ch" =~ ^0+$ ]] && return 1
+    ch="$(pick_num "$ch" "${#ports[@]}")" || { warn "no forward numbered $ch"; return 1; }
+    PORT_PICK="${ports[$((ch-1))]}"; PORT_KIND="${kinds[$((ch-1))]}"
     return 0
 }
 
@@ -1684,12 +1778,14 @@ banner() {
     clear 2>/dev/null || true
     local crumb="${1:-}" myip; myip="$(default_local_ip 2>/dev/null)"
     _state_counts
-    local fwd=0 n c pf
+    local fwd=0 n c m pf mc
     for n in $(list_instances); do
-        pf="$(inst_pf "$n")"; c=0
-        [[ -s "$pf" ]] && c=$(grep -c . "$pf" 2>/dev/null)
+        pf="$(inst_pf "$n")"; mc="$(mux_conf "$n")"; c=0; m=0
+        [[ -s "$pf" ]] && c=$(grep -c . "$pf" 2>/dev/null || true)
+        [[ -s "$mc" ]] && m=$(grep -c . "$mc" 2>/dev/null || true)
         [[ "$c" =~ ^[0-9]+$ ]] || c=0
-        fwd=$((fwd+c))
+        [[ "$m" =~ ^[0-9]+$ ]] || m=0
+        fwd=$((fwd+c+m))
     done
     if [[ -n "$crumb" ]]; then
         local right; right="${myip:-?} · $(arch_tag)"
@@ -1753,13 +1849,13 @@ bench_table() {
         IFS='|' read -r t dl ul ls pg <<< "$r"; v="$(_mbit "$dl")"
         sorted+=("$(printf '%012.3f|%s' "$v" "$r")")
         if _gt "$v" "$max"; then max="$v"; fi
-        case "$t" in udp|tcp|mux|ws|hysteria|fou) if _gt "$v" "$sv"; then sv="$v"; stealth="$t"; fi;; esac
+        case "$t" in udp|tcp|mux|ws|hysteria|fou|icmp|reverse-mux) if _gt "$v" "$sv"; then sv="$v"; stealth="$t"; fi;; esac
     done
     local OIFS="$IFS"; IFS=$'\n'; sorted=($(printf '%s\n' "${sorted[@]}" | sort -r)); IFS="$OIFS"
     echo
     printf '  %braw path (plain TCP, policed)%b   down %b%s%b / up %b%s%b   rtt %b%s ms%b\n\n' \
         "$C_GREY" "$C_RESET" "$C_WHITE" "${RAW_DL:-n/a}" "$C_RESET" "$C_WHITE" "${RAW_UL:-n/a}" "$C_RESET" "$C_WHITE" "${RAW_PING:-n/a}" "$C_RESET"
-    printf '    %b%-9s %-14s %-9s %-7s %-6s %s%b\n' "$C_GREY" "TYPE" "DOWNLOAD" "UPLOAD" "" "LOSS" "PING" "$C_RESET"
+    printf '    %b%-12s %-14s %-8s %-8s %-6s %-5s %s%b\n' "$C_GREY" "TYPE" "" "DOWNLOAD" "UPLOAD" "LOSS" "PING" "NOTE" "$C_RESET"
     local first=1 n bar bc lcol lsc ucol mark note dnum unum
     for line in "${sorted[@]}"; do
         v="${line%%|*}"; r="${line#*|}"; IFS='|' read -r t dl ul ls pg <<< "$r"
@@ -1773,7 +1869,7 @@ bench_table() {
         dnum="$dl"; [[ "$dl" == *bits/sec* ]] && dnum="${dl%% *}$(printf '%s' "${dl#* }" | cut -c1)"
         unum="$ul"; [[ "$ul" == *bits/sec* ]] && unum="${ul%% *}$(printf '%s' "${ul#* }" | cut -c1)"
         ucol="$lcol"; [[ "$ul" == FAIL || "$ul" == n/a ]] && ucol="$C_BYEL"
-        printf '  %b%s%b %b%-9s%b %b%s%b %b%-7s%b %b%-8s%b %b%-6s%b %-5s %b%s%b\n' \
+        printf '  %b%s%b %b%-12s%b %b%s%b %b%-8s%b %b%-8s%b %b%-6s%b %-5s %b%s%b\n' \
             "$C_BGRN" "$mark" "$C_RESET" "$lcol" "$t" "$C_RESET" \
             "$bc" "$bar" "$C_RESET" "$lcol" "$dnum" "$C_RESET" \
             "$ucol" "$unum" "$C_RESET" \
@@ -1798,7 +1894,7 @@ menu_instances() {
         nitem 0 "Back"
         rule_green
         printf '  %bEnter your choice [0-5]:%b ' "$C_BGRN" "$C_RESET"
-        read -r c
+        read -r c || exit 0
         case "$c" in
             1) wizard_add; pause;;
             2) wizard_add_manual; pause;;
@@ -1813,15 +1909,25 @@ menu_pf() {
     while true; do
         banner "Port forwarding"
         heading "a port hit on this box is tunneled to the far side"
-        local n pf any=0
+        local n pf mc any=0
         for n in $(list_instances); do
-            pf="$(inst_pf "$n")"; any=1
+            pf="$(inst_pf "$n")"; mc="$(mux_conf "$n")"; any=1
             printf '  %b%s%b %b%s%b\n' "$C_MAG" "$G_V" "$C_RESET" "$C_BOLD$C_WHITE" "$n" "$C_RESET"
+            local shown=0
             if [[ -s "$pf" ]]; then
                 local proto port
                 while IFS=: read -r proto port; do [[ -z "$proto" ]] && continue
+                    shown=1
                     printf '       %b%s%b %b%-4s%b %s\n' "$C_GREEN" "$G_ARROW" "$C_RESET" "$C_CYAN" "$proto" "$C_RESET" "$port"; done < "$pf"
-            else printf '       %b(no forwards)%b\n' "$C_DIM" "$C_RESET"; fi
+            fi
+            if [[ -s "$mc" ]]; then
+                local mp mdh mdp
+                while IFS=: read -r mp mdh mdp; do [[ -z "$mp" ]] && continue
+                    shown=1
+                    printf '       %b%s%b %b%-4s%b %s %b-> %s:%s%b\n' "$C_GREEN" "$G_ARROW" "$C_RESET" \
+                        "$C_BMAG" "mux" "$C_RESET" "$mp" "$C_GREY" "$mdh" "$mdp" "$C_RESET"; done < "$mc"
+            fi
+            [[ "$shown" == 0 ]] && printf '       %b(no forwards)%b\n' "$C_DIM" "$C_RESET"
         done
         [[ "$any" == 0 ]] && printf '  %b(add a tunnel first)%b\n' "$C_DIM" "$C_RESET"
         echo
@@ -1830,14 +1936,18 @@ menu_pf() {
         nitem 0 "Back"
         rule_green
         printf '  %bEnter your choice [0-2]:%b ' "$C_BGRN" "$C_RESET"
-        read -r c
+        read -r c || exit 0
         case "$c" in
             1) if pick_instance; then n="$PICK"
                  if pick_proto; then read -erp "  port number: " po
                      if [[ "$po" =~ ^[0-9]+$ ]]; then pf_add "$n" "$PROTO" "$po"; else warn "port must be a number"; fi
                  fi
                fi; pause;;
-            2) if pick_instance; then n="$PICK"; if pick_fwd_port "$n"; then pf_del "$n" "$PORT_PICK"; fi; fi; pause;;
+            2) if pick_instance; then n="$PICK"
+                 if pick_fwd_port "$n"; then
+                     if [[ "$PORT_KIND" == mux ]]; then cmd_mux_del "$n" "$PORT_PICK"; else pf_del "$n" "$PORT_PICK"; fi
+                 fi
+               fi; pause;;
             0) return;;
         esac
     done
@@ -1857,7 +1967,7 @@ menu_main() {
         nitem 0 "Exit"
         rule_green
         printf '  %bEnter your choice [0-7]:%b ' "$C_BGRN" "$C_RESET"
-        read -r c
+        read -r c || exit 0
         case "$c" in
             1) bench_run; pause;;
             2) local fh mip; read -erp "Foreign server IP: " fh; mip="$(default_local_ip)"; read -erp "This box public IP [$mip]: " x; mip="${x:-$mip}"; [[ -n "$fh" ]] && cmd_bench_manual "$fh" "$mip"; pause;;

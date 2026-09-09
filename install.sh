@@ -77,6 +77,8 @@ else
     curl -fsSL "${NOCACHE[@]}" "$RAW/bin/chisel-$ARCH$CB"   -o "$DEST/bin/chisel-$ARCH" || true
 fi
 
+bash -n "$DEST/omnitunnel.sh" 2>/dev/null || { echo "downloaded omnitunnel.sh is not a valid script (bad mirror / captive portal?) - aborting"; exit 1; }
+[[ -s "$DEST/bin/omnitun-$ARCH" ]] || { echo "core binary omnitun-$ARCH is missing or empty - aborting"; exit 1; }
 chmod +x "$DEST/bin/omnitun-$ARCH" "$DEST/omnitunnel.sh"
 install -m 0755 "$DEST/bin/omnitun-$ARCH" /usr/local/bin/omnitun
 [[ -f "$DEST/bin/hysteria-$ARCH" ]] && { chmod +x "$DEST/bin/hysteria-$ARCH"; install -m 0755 "$DEST/bin/hysteria-$ARCH" /usr/local/bin/hysteria; }
@@ -100,7 +102,8 @@ else
         # the core binary actually changed - restart running tunnels to pick it up.
         changed=0
         for u in $(systemctl list-units 'omnitun-*.service' --state=active --no-legend 2>/dev/null | awk '{print $1}'); do
-            case "$u" in *-pf-*.service) continue;; esac
+            iname="${u#omnitun-}"; iname="${iname%.service}"
+            [[ -f "/etc/omnitunnel/inst/$iname/instance.conf" ]] || continue
             echo "  restarting $u"; systemctl restart "$u" 2>/dev/null || true; changed=1
         done
         # Then bounce the port-forward relays. They don't use the core binary, but
@@ -110,7 +113,9 @@ else
         # wedged on the dead socket and traffic degrades to "very slow" instead of
         # erroring cleanly. Restarting the relays reconnects through the fresh tunnel.
         if [[ "$changed" == 1 ]]; then
-            for u in $(systemctl list-units 'omnitun-*-pf-*.service' --state=active --no-legend 2>/dev/null | awk '{print $1}'); do
+            for u in $(systemctl list-units 'omnitun-*-pf-*.service' 'omnitun-*-mux.service' --state=active --no-legend 2>/dev/null | awk '{print $1}'); do
+                iname="${u#omnitun-}"; iname="${iname%.service}"
+                [[ -f "/etc/omnitunnel/inst/$iname/instance.conf" ]] && continue
                 echo "  restarting relay $u"; systemctl restart "$u" 2>/dev/null || true
             done
         fi

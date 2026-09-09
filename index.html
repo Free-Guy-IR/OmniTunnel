@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>icmptun — an IP tunnel disguised as an echo</title>
-<meta name="description" content="A point-to-point IP tunnel that disguises traffic as genuine ICMP echo request/reply packets, for paths that police every protocol except ping.">
+<title>OmniTunnel — benchmark ten transports, keep the winner</title>
+<meta name="description" content="Ten tunnel transports (gre, icmp, udp, tcp, mux, ws, hysteria, fou, vxlan, reverse-mux) in one manager. Benchmark them end-to-end on your own link, in both directions, and keep the winner.">
 <style>
   :root {
     --bg: #0a0e14;
@@ -392,6 +392,39 @@
   @media (prefers-reduced-motion: reduce) {
     * { animation-duration: 0.001ms !important; animation-iteration-count: 1 !important; }
   }
+
+  .bench-note { color: var(--text-faint); font-size: 13px; margin-top: 14px; line-height: 1.65; }
+  .bench-block { margin-top: 30px; }
+  .bench-head { display: flex; align-items: baseline; justify-content: space-between; gap: 16px;
+                flex-wrap: wrap; padding-bottom: 10px; border-bottom: 1px solid var(--border); }
+  .bench-head h3 { margin: 0; font-size: 15px; letter-spacing: .01em; }
+  .bench-head .raw { font-family: var(--mono); font-size: 12.5px; color: var(--text-faint); }
+  .bench-cols { display: grid; grid-template-columns: 118px 1fr 76px 76px;
+                gap: 12px; padding: 10px 0 6px; font-family: var(--mono);
+                font-size: 11px; letter-spacing: .08em; text-transform: uppercase; color: var(--text-faint); }
+  .bench-cols span:nth-child(3), .bench-cols span:nth-child(4) { text-align: right; }
+  .bench-row { display: grid; grid-template-columns: 118px 1fr 76px 76px; gap: 12px;
+               align-items: center; padding: 7px 0; border-bottom: 1px solid var(--border-soft); }
+  .bench-row:last-of-type { border-bottom: 0; }
+  .bench-name { font-family: var(--mono); font-size: 13px; color: var(--text); white-space: nowrap; }
+  .bench-row.win .bench-name { color: var(--accent); }
+  .bench-row.dim .bench-name, .bench-row.dim .bench-num { color: var(--text-faint); }
+  .bench-track { background: var(--bg-inset); border-radius: 2px; height: 15px; overflow: hidden; }
+  .bench-fill { height: 100%; background: var(--accent-dim); border-radius: 2px; }
+  .bench-row.win .bench-fill { background: var(--accent); }
+  .bench-row.good .bench-fill { background: var(--good); }
+  .bench-row.bad .bench-fill { background: #c9694f; }
+  .bench-num { font-family: var(--mono); font-size: 13px; text-align: right; color: var(--text); white-space: nowrap; }
+  .bench-num.na { color: var(--text-faint); }
+  .bench-tag { display: inline-block; margin-left: 8px; font-family: var(--mono); font-size: 10.5px;
+               letter-spacing: .06em; text-transform: uppercase; color: var(--text-faint);
+               border: 1px solid var(--border); border-radius: 3px; padding: 1px 5px; vertical-align: 1px; }
+  .bench-row.win .bench-tag { color: var(--accent); border-color: var(--accent-dim); }
+  .bench-sub { color: var(--text-faint); }
+  @media (max-width: 620px) {
+    .bench-cols, .bench-row { grid-template-columns: 104px 1fr 68px; }
+    .bench-cols span:nth-child(4), .bench-row .bench-num:last-child { display: none; }
+  }
 </style>
 </head>
 <body>
@@ -399,12 +432,13 @@
 <div class="topbar">
   <div class="topbar-inner">
     <a class="brand" href="#top">
-      <span class="dot"></span>icmptun
+      <span class="dot"></span>OmniTunnel
     </a>
     <div class="toplinks">
       <a href="#install">install</a>
+      <a href="#benchmark">benchmark</a>
       <a href="#how">how it works</a>
-      <a href="https://github.com/Free-Guy-IR/icmptun">source</a>
+      <a href="https://github.com/Free-Guy-IR/OmniTunnel">source</a>
     </div>
   </div>
 </div>
@@ -415,7 +449,7 @@
     <div class="eyebrow"><span class="rule"></span>ip tunnel · disguised as ping</div>
     <h1>Every protocol gets<br>throttled. <span class="accent">Echo</span><br>doesn't.</h1>
     <p class="lede">
-      <strong>icmptun</strong> carries ordinary IP traffic — TCP, UDP, anything —
+      <strong>OmniTunnel</strong> carries ordinary IP traffic — TCP, UDP, anything —
       wrapped inside genuine ICMP echo request/reply packets, for links where
       everything else gets an initial burst through and then goes silent, but
       a plain <code class="mono">ping</code> keeps working the whole time.
@@ -426,7 +460,7 @@
         <span>install — run on each box</span>
         <button class="copy-btn" onclick="copyInstall(this)">copy</button>
       </div>
-      <pre id="install-cmd"><span class="tok-cmd">curl</span> -fsSL https://raw.githubusercontent.com/Free-Guy-IR/icmptun/main/install.sh -o /tmp/icmptun-install.sh <span class="tok-dim">&&</span> <span class="tok-cmd">sudo bash</span> /tmp/icmptun-install.sh</pre>
+      <pre id="install-cmd"><span class="tok-cmd">curl</span> -fsSL https://raw.githubusercontent.com/Free-Guy-IR/OmniTunnel/main/install.sh -o /tmp/omnitunnel-install.sh <span class="tok-dim">&&</span> <span class="tok-cmd">sudo bash</span> /tmp/omnitunnel-install.sh</pre>
     </div>
     <p class="install-note">One command. Downloads the tool, drops you into the setup wizard. If <code>raw.githubusercontent.com</code> is itself filtered, add <code>--socks5 host:port</code> to the second command.</p>
 
@@ -473,6 +507,120 @@
         <p>Steady request/reply, indefinitely, at full volume.</p>
       </div>
     </div>
+  </section>
+
+  <section id="benchmark">
+    <div class="eyebrow"><span class="rule"></span>the evidence</div>
+    <h2>Nothing wins everywhere. So measure it.</h2>
+    <p class="lead">
+      The manager builds every transport end-to-end against your own foreign box,
+      measures <strong>both directions</strong> with parallel streams, tears the test
+      tunnels down again, and ranks what survived. Two real captures, two completely
+      different answers — which is the whole point.
+    </p>
+
+    <div class="bench-block">
+      <div class="bench-head">
+        <h3>A route that polices nothing in particular</h3>
+        <span class="raw">raw path 1.91 Gbit/s &middot; rtt 39 ms</span>
+      </div>
+      <div class="bench-cols"><span>transport</span><span></span><span>down</span><span>up</span></div>
+        <div class="bench-row win">
+          <div class="bench-name">gre<span class="bench-tag">fastest</span></div>
+          <div class="bench-track"><div class="bench-fill" style="width:100.0%"></div></div>
+          <div class="bench-num">925M</div><div class="bench-num na">—</div>
+        </div>
+        <div class="bench-row">
+          <div class="bench-name">fou<span class="bench-tag">stealth</span></div>
+          <div class="bench-track"><div class="bench-fill" style="width:95.7%"></div></div>
+          <div class="bench-num">885M</div><div class="bench-num na">—</div>
+        </div>
+        <div class="bench-row">
+          <div class="bench-name">tcp</div>
+          <div class="bench-track"><div class="bench-fill" style="width:69.5%"></div></div>
+          <div class="bench-num">643M</div><div class="bench-num na">—</div>
+        </div>
+        <div class="bench-row">
+          <div class="bench-name">vxlan</div>
+          <div class="bench-track"><div class="bench-fill" style="width:60.6%"></div></div>
+          <div class="bench-num">561M</div><div class="bench-num na">—</div>
+        </div>
+        <div class="bench-row">
+          <div class="bench-name">ws</div>
+          <div class="bench-track"><div class="bench-fill" style="width:59.9%"></div></div>
+          <div class="bench-num">554M</div><div class="bench-num na">—</div>
+        </div>
+        <div class="bench-row">
+          <div class="bench-name">mux</div>
+          <div class="bench-track"><div class="bench-fill" style="width:54.9%"></div></div>
+          <div class="bench-num">508M</div><div class="bench-num na">—</div>
+        </div>
+        <div class="bench-row">
+          <div class="bench-name">udp</div>
+          <div class="bench-track"><div class="bench-fill" style="width:51.9%"></div></div>
+          <div class="bench-num">480M</div><div class="bench-num na">—</div>
+        </div>
+        <div class="bench-row">
+          <div class="bench-name">icmp</div>
+          <div class="bench-track"><div class="bench-fill" style="width:47.5%"></div></div>
+          <div class="bench-num">439M</div><div class="bench-num na">—</div>
+        </div>
+        <div class="bench-row dim">
+          <div class="bench-name">hysteria</div>
+          <div class="bench-track"><div class="bench-fill" style="width:20.9%"></div></div>
+          <div class="bench-num">193M</div><div class="bench-num na">—</div>
+        </div>
+      <p class="bench-note">
+        Kernel <code class="mono">gre</code> takes it at line-rate, with
+        <code class="mono">fou</code> (GRE hidden inside plain UDP) a whisker behind
+        while looking like ordinary traffic on the wire. This ISP polices neither TCP
+        nor arbitrary UDP, so the encrypted carriers all clear 500 Mbit too. This
+        capture predates the upload column, so its up cells read —.
+      </p>
+    </div>
+
+    <div class="bench-block">
+      <div class="bench-head">
+        <h3>A route that polices <em>upload</em></h3>
+        <span class="raw">relay &rarr; NL &middot; same ICMP carrier throughout</span>
+      </div>
+      <div class="bench-cols"><span>transport</span><span></span><span>down</span><span>up</span></div>
+        <div class="bench-row good">
+          <div class="bench-name">icmp <span class="bench-sub">1 flow</span></div>
+          <div class="bench-track"><div class="bench-fill" style="width:77.1%"></div></div>
+          <div class="bench-num na">—</div><div class="bench-num">185M</div>
+        </div>
+        <div class="bench-row bad">
+          <div class="bench-name">icmp <span class="bench-sub">8 flows</span><span class="bench-tag">collapses</span></div>
+          <div class="bench-track"><div class="bench-fill" style="width:9.1%"></div></div>
+          <div class="bench-num na">—</div><div class="bench-num">21.8M</div>
+        </div>
+        <div class="bench-row">
+          <div class="bench-name">reverse-mux <span class="bench-sub">8</span></div>
+          <div class="bench-track"><div class="bench-fill" style="width:94.2%"></div></div>
+          <div class="bench-num na">—</div><div class="bench-num">226M</div>
+        </div>
+        <div class="bench-row win">
+          <div class="bench-name">reverse-mux <span class="bench-sub">32</span><span class="bench-tag">fastest</span></div>
+          <div class="bench-track"><div class="bench-fill" style="width:100.0%"></div></div>
+          <div class="bench-num na">—</div><div class="bench-num">240M</div>
+        </div>
+      <p class="bench-note">
+        Here a download ranking would tell you nothing. One sustained flow uploads at
+        185 Mbit — but the moment real users open eight at once the aggregate
+        collapses to 21.8. <code class="mono">reverse-mux</code> funnels every
+        connection into a single flow, so the policer never sees the parallel burst it
+        punishes: <strong>226 Mbit at 8 streams, 240 at 32</strong> — a ~10&times;
+        upload difference on the same link. On this same path raw ICMP
+        echo-<em>request</em> was 100% dropped while echo-<em>reply</em> passed untouched.
+      </p>
+    </div>
+
+    <p class="bench-note">
+      Both tables came straight out of <code class="mono">omnitunnel bench</code>. Your
+      link will land somewhere else — run it, keep the winner, re-run it whenever
+      conditions change.
+    </p>
   </section>
 
   <section id="how">
@@ -524,14 +672,14 @@
           <rect x="40" y="56" width="140" height="24" rx="4" fill="var(--bg-inset)" stroke="var(--border-soft)"/>
           <text x="110" y="72" text-anchor="middle">tun0</text>
           <rect x="40" y="86" width="140" height="16" rx="3" fill="none"/>
-          <text x="110" y="98" text-anchor="middle" fill="var(--text-faint)">icmptun core</text>
+          <text x="110" y="98" text-anchor="middle" fill="var(--text-faint)">omnitun core</text>
 
           <rect x="440" y="20" width="180" height="90" rx="8" fill="none" stroke="var(--border)"/>
           <text x="530" y="42" text-anchor="middle" fill="var(--text)" font-weight="700">server box</text>
           <rect x="460" y="56" width="140" height="24" rx="4" fill="var(--bg-inset)" stroke="var(--border-soft)"/>
           <text x="530" y="72" text-anchor="middle">tun0</text>
           <rect x="460" y="86" width="140" height="16" rx="3" fill="none"/>
-          <text x="530" y="98" text-anchor="middle" fill="var(--text-faint)">icmptun core</text>
+          <text x="530" y="98" text-anchor="middle" fill="var(--text-faint)">omnitun core</text>
 
           <line x1="200" y1="55" x2="440" y2="55" stroke="var(--accent)" stroke-width="1.4" marker-end="url(#arrow)"/>
           <text x="320" y="48" text-anchor="middle" fill="var(--accent)">echo request (type 8)</text>
@@ -589,30 +737,31 @@
     <h2>Usage</h2>
     <p>Running with no arguments opens the interactive menu — the normal way to use it day to day. Every action is also a direct subcommand for scripting.</p>
     <div class="cli"><span class="comment"># day to day</span>
-icmptun-ctl.sh                    <span class="comment"># interactive menu</span>
-icmptun-ctl.sh status             <span class="comment"># tunnel health, ping, active forwards</span>
-icmptun-ctl.sh pf add 8080 both   <span class="comment"># tcp+udp, defaults to the peer, same port</span>
-icmptun-ctl.sh pf del 8080 both
-icmptun-ctl.sh bbr on
+omnitunnel                        <span class="comment"># interactive menu</span>
+omnitunnel bench                  <span class="comment"># measure every transport, both directions</span>
+omnitunnel list                   <span class="comment"># tunnel health, rtt, loss</span>
+omnitunnel pf-add  main both 8080 <span class="comment"># tcp+udp, forwarded to the far side</span>
+omnitunnel pf-del  main 8080
+omnitunnel mux-add main 443 127.0.0.1 443  <span class="comment"># single-flow muxed forward</span>
 
 <span class="comment"># a second, independent tunnel on the same box</span>
-<span class="c1">ICMPTUN_INSTANCE</span>=second icmptun-ctl.sh init --role client -L &lt;ip&gt; -R &lt;ip&gt;
-<span class="c1">ICMPTUN_INSTANCE</span>=second icmptun-ctl.sh enable</div>
-    <p style="font-size:14px;">Full reference, architecture notes, and the source itself live in the <a href="https://github.com/Free-Guy-IR/icmptun">repository</a>.</p>
+omnitunnel add-auto   gre second &lt;foreign_ip&gt;
+omnitunnel add-manual gre second &lt;foreign_ip&gt;   <span class="comment"># no SSH: prints a token to paste abroad</span></div>
+    <p style="font-size:14px;">Full reference, architecture notes, and the source itself live in the <a href="https://github.com/Free-Guy-IR/OmniTunnel">repository</a>.</p>
   </section>
 
 </div>
 
 <footer>
   <div class="wrap foot-row">
-    <span>icmptun · MIT licensed</span>
-    <span><a href="https://github.com/Free-Guy-IR/icmptun">github.com/Free-Guy-IR/icmptun</a></span>
+    <span>OmniTunnel · MIT licensed</span>
+    <span><a href="https://github.com/Free-Guy-IR/OmniTunnel">github.com/Free-Guy-IR/OmniTunnel</a></span>
   </div>
 </footer>
 
 <script>
   function copyInstall(btn) {
-    var text = "curl -fsSL https://raw.githubusercontent.com/Free-Guy-IR/icmptun/main/install.sh -o /tmp/icmptun-install.sh && sudo bash /tmp/icmptun-install.sh";
+    var text = "curl -fsSL https://raw.githubusercontent.com/Free-Guy-IR/OmniTunnel/main/install.sh -o /tmp/omnitunnel-install.sh && sudo bash /tmp/omnitunnel-install.sh";
     navigator.clipboard.writeText(text).then(function () {
       var orig = btn.textContent;
       btn.textContent = "copied";

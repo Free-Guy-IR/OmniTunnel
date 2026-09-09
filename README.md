@@ -16,10 +16,10 @@ ICMP is now just one of the nine transports.)
 
 ---
 
-## Why nine transports?
+## Why ten transports?
 
 No single tunnel wins everywhere. What an ISP lets through — and how fast — is
-**per-route and per-transport**, and it changes. OmniTunnel ships all nine and
+**per-route and per-transport**, and it changes. OmniTunnel ships all ten and
 lets you **benchmark them and keep the winner**:
 
 | Mode | What it is | Best when |
@@ -33,6 +33,7 @@ lets you **benchmark them and keep the winner**:
 | `hysteria` | **Hysteria2 / QUIC** — bundled engine with the loss-agnostic *Brutal* congestion control, salamander obfuscation and a real website masquerade | UDP passes but is **rate-policed or lossy**: Brutal ignores the induced loss and pushes at a fixed rate, so a policed UDP path that crawls at a few Mbit for `udp` runs an order of magnitude faster here — while looking exactly like HTTP/3 |
 | `fou`  | **GRE-in-UDP** (Foo-over-UDP), native kernel tunnel (no key) — a GRE tunnel wrapped inside an ordinary UDP packet on a port you choose | You want GRE's near-line-rate speed but the ISP blocks raw protocol-47, or the carrier must **look like plain UDP** instead of a GRE tunnel |
 | `vxlan` | **VXLAN**, native kernel tunnel (no key) — Ethernet-in-UDP, the standard datacenter overlay | A kernel UDP carrier that blends in as ordinary overlay traffic; useful where `fou`'s GRE-in-UDP is fingerprinted but VXLAN is not |
+| `reverse-mux` | **ICMP echo-*reply* + single-flow MUX** (no key) — the icmp engine with the emitted echo type forced to reply, plus a chisel reverse tunnel that collapses every user connection into **one** flow | The relay→foreign **upload** is policed: many parallel connections get shredded (they collapse to a few Mbit) while a single sustained flow stays near line-rate. Also dodges paths that drop echo-*request* (type 8) in one direction but pass echo-*reply* (type 0) |
 
 Many ISPs police only the *common* transports (TCP/UDP) and pass the "tunnel"
 protocols — GRE (IP proto 47) and ICMP — at the link's real physical rate. On
@@ -103,19 +104,22 @@ route — an Iran server to a foreign box:
 ```
 ──────────────────────────  Benchmark results  ──────────────────────────
 
-  raw path (plain TCP)   1.91 Gbits/sec   rtt 39 ms
+  raw path (plain TCP, policed)   down 1.91 Gbits/sec / up 850 Mbits/sec   rtt 39 ms
 
-    TYPE      DOWNLOAD              LOSS   PING
-  → gre       ██████████████ 925M    0%     39    fastest
-    fou       █████████████  885M    0%     39    stealth pick
-    tcp       ██████████     643M    0%     41
-    vxlan     ████████       561M    0%     39
-    ws        ████████       554M    0%     44
-    mux       ████████       508M    0%     43
-    udp       ███████        480M    0%     40
-    icmp      ███████        439M    0%     40
-    hysteria  ███            193M    0%     44
+    TYPE                        DOWNLOAD UPLOAD   LOSS   PING  NOTE
+  → gre          ██████████████ 925M     —        0%     39    fastest
+    fou          █████████████  885M     —        0%     39    stealth pick
+    tcp          ██████████     643M     —        0%     41
+    vxlan        ████████       561M     —        0%     39
+    ws           ████████       554M     —        0%     44
+    mux          ████████       508M     —        0%     43
+    udp          ███████        480M     —        0%     40
+    icmp         ███████        439M     —        0%     40
+    hysteria     ███            193M     —        0%     44
 ```
+
+> This capture predates the UPLOAD column (added in 2.7.7), so its upload cells
+> read `—`; a run on today's build fills both directions.
 
 The bar is scaled to the fastest tunnel; **→** marks the outright winner and
 **stealth pick** marks the fastest *fully obfuscated* transport. Here kernel `gre` leads at 925 Mbit and `fou` (GRE-in-UDP) sits right behind at
@@ -132,6 +136,30 @@ from the menu any time conditions change.
 
 > A real measurement taken end-to-end through the manager on one representative
 > route; your own link will land differently — benchmark it and keep the winner.
+
+### The other shape: a route that polices *upload*
+
+Download-fast is not the whole story. On a hostile Iran→foreign path the
+**relay→foreign upload** is often the policed direction, and it fails in a
+specific way: **one** sustained flow runs near line-rate, but the moment real
+users open many parallel connections the aggregate collapses. Measured on such a
+route (relay → NL, `iperf3` through the tunnel):
+
+| what was measured | upload |
+|---|---|
+| plain ICMP tunnel, single flow (`-P 1`, 20 s sustained) | **185 Mbit** — stable |
+| plain ICMP tunnel, 8 parallel flows (`-P 8`) | **21.8 Mbit** — collapses |
+| `reverse-mux` (same tunnel + single-flow MUX), `-P 8` | **226 Mbit** |
+| `reverse-mux`, `-P 32` | **240 Mbit** |
+
+Same link, same ICMP carrier — the only difference is that `reverse-mux` funnels
+every connection into one flow, so the policer never sees the parallel burst it
+punishes. On that route it is a **~10×** upload difference, which is why the
+benchmark measures both directions rather than download alone.
+
+On the very same path, raw ICMP echo-*request* (type 8) was **100 % dropped**
+while echo-*reply* (type 0) passed untouched — the directional, type-specific
+block `reverse-mux` is built to walk around.
 
 ---
 
