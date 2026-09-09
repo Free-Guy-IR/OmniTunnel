@@ -6,13 +6,13 @@
 
 **A multi-protocol, obfuscated tunnel suite for bypassing per-destination
 traffic policing and DPI.** Prebuilt static binaries, one English
-menu-driven manager, nine interchangeable tunnel transports, and any
+menu-driven manager, ten interchangeable tunnel transports, and any
 many-to-many topology you need.
 
 Built and hardened against real Iran ⇄ abroad conditions, where different ISPs
 police, throttle, or block traffic very differently depending on the transport
 and the destination datacenter. (Formerly the ICMP-only `icmptun` project —
-ICMP is now just one of the nine transports.)
+ICMP is now just one of the ten transports.)
 
 ---
 
@@ -91,9 +91,9 @@ cd OmniTunnel && sudo ./install.sh && omnitunnel
 From the main menu choose **“Benchmark all tunnels & pick the best.”** Point it
 at a foreign server (IP + SSH login) and it will:
 
-1. measure the **raw** path (download + rtt),
-2. bring up each of the nine tunnels in turn and measure **download, packet
-   loss and ping** through it,
+1. measure the **raw** path (download, upload + rtt),
+2. bring up each of the ten tunnels in turn and measure **download, upload,
+   packet loss and ping** through it,
 3. print a comparison table,
 4. **remove every test tunnel from both sides**, then let you keep exactly one
    as a permanent instance.
@@ -102,31 +102,33 @@ Real numbers, measured end-to-end through the manager on a fast Iran→foreign
 route — an Iran server to a foreign box:
 
 ```
-──────────────────────────  Benchmark results  ──────────────────────────
+────────────────────────  Benchmark results  ────────────────────────
 
-  raw path (plain TCP, policed)   down 1.91 Gbits/sec / up 850 Mbits/sec   rtt 39 ms
+  raw path (plain TCP, policed)   down 228 Mbits/sec / up 77.7 Mbits/sec   rtt 83 ms
 
     TYPE                        DOWNLOAD UPLOAD   LOSS   PING  NOTE
-  → gre          ██████████████ 925M     —        0%     39    fastest
-    fou          █████████████  885M     —        0%     39    stealth pick
-    tcp          ██████████     643M     —        0%     41
-    vxlan        ████████       561M     —        0%     39
-    ws           ████████       554M     —        0%     44
-    mux          ████████       508M     —        0%     43
-    udp          ███████        480M     —        0%     40
-    icmp         ███████        439M     —        0%     40
-    hysteria     ███            193M     —        0%     44
+  → gre          ██████████████ 700M     FAIL     0%     71    fastest
+    fou          █████████████  641M     4.62M    0%     78    stealth pick
+    icmp         ████████████  624M     395M     0%     84
+    vxlan        ███████████   562M     120M     0%     77
+    mux          ███████████   539M     99.2M    0%     70
+    udp          ███████████   532M     81.7M    0%     77
+    ws           ██████        300M     79.2M    0%     79
+    reverse-mux  █████         233M     FAIL     0%     83
+    hysteria     ████          198M     FAIL     0%     83
+    tcp          █             69.6M    99.5M    0%     81
 ```
 
-> This capture predates the UPLOAD column (added in 2.7.7), so its upload cells
-> read `—`; a run on today's build fills both directions.
+Measured 10 September 2026, one Iran relay to one foreign box, every transport
+built and torn down in sequence by `omnitunnel bench` itself.
 
 The bar is scaled to the fastest tunnel; **→** marks the outright winner and
-**stealth pick** marks the fastest *fully obfuscated* transport. Here kernel `gre` leads at 925 Mbit and `fou` (GRE-in-UDP) sits right behind at
-885 while looking like ordinary UDP on the wire — and the encrypted `tcp`, `ws`
-and `mux` carriers all clear 500 Mbit on this path too. (This ISP polices neither
-plain TCP nor arbitrary UDP; it only blocks the narrow WireGuard port range,
-which `fou`/`vxlan`/`udp` sidestep.)
+**stealth pick** marks the fastest *fully obfuscated* transport. Read the two
+columns against each other: kernel `gre` takes the download at 700 Mbit but
+returns **nothing** upstream, and `fou` pairs 641 down with a collapsed 4.62 up.
+The only transport that carries both directions here is `icmp` — 624 down and
+**395 up, roughly five times the 77.7 Mbit the raw path itself managed**. A
+download-only ranking would have picked exactly the wrong tunnel on this link.
 
 The winner is **link-specific**: where the ISP fingerprints GRE the encrypted
 UDP carriers lead, where it rate-crushes UDP the plaintext `gre`/`icmp` do, and

@@ -521,61 +521,68 @@
 
     <div class="bench-block">
       <div class="bench-head">
-        <h3>A route that polices nothing in particular</h3>
-        <span class="raw">raw path 1.91 Gbit/s &middot; rtt 39 ms</span>
+        <h3>A real run, 10 September 2026</h3>
+        <span class="raw">raw path 228 Mbit/s down &middot; 77.7 up &middot; rtt 83 ms</span>
       </div>
       <div class="bench-cols"><span>transport</span><span></span><span>down</span><span>up</span></div>
         <div class="bench-row win">
           <div class="bench-name">gre<span class="bench-tag">fastest</span></div>
           <div class="bench-track"><div class="bench-fill" style="width:100.0%"></div></div>
-          <div class="bench-num">925M</div><div class="bench-num na">—</div>
+          <div class="bench-num">700M</div><div class="bench-num na">FAIL</div>
         </div>
         <div class="bench-row">
           <div class="bench-name">fou<span class="bench-tag">stealth</span></div>
-          <div class="bench-track"><div class="bench-fill" style="width:95.7%"></div></div>
-          <div class="bench-num">885M</div><div class="bench-num na">—</div>
+          <div class="bench-track"><div class="bench-fill" style="width:91.6%"></div></div>
+          <div class="bench-num">641M</div><div class="bench-num">4.62M</div>
         </div>
-        <div class="bench-row">
-          <div class="bench-name">tcp</div>
-          <div class="bench-track"><div class="bench-fill" style="width:69.5%"></div></div>
-          <div class="bench-num">643M</div><div class="bench-num na">—</div>
+        <div class="bench-row good">
+          <div class="bench-name">icmp<span class="bench-tag">best upload</span></div>
+          <div class="bench-track"><div class="bench-fill" style="width:89.1%"></div></div>
+          <div class="bench-num">624M</div><div class="bench-num">395M</div>
         </div>
         <div class="bench-row">
           <div class="bench-name">vxlan</div>
-          <div class="bench-track"><div class="bench-fill" style="width:60.6%"></div></div>
-          <div class="bench-num">561M</div><div class="bench-num na">—</div>
-        </div>
-        <div class="bench-row">
-          <div class="bench-name">ws</div>
-          <div class="bench-track"><div class="bench-fill" style="width:59.9%"></div></div>
-          <div class="bench-num">554M</div><div class="bench-num na">—</div>
+          <div class="bench-track"><div class="bench-fill" style="width:80.3%"></div></div>
+          <div class="bench-num">562M</div><div class="bench-num">120M</div>
         </div>
         <div class="bench-row">
           <div class="bench-name">mux</div>
-          <div class="bench-track"><div class="bench-fill" style="width:54.9%"></div></div>
-          <div class="bench-num">508M</div><div class="bench-num na">—</div>
+          <div class="bench-track"><div class="bench-fill" style="width:77.0%"></div></div>
+          <div class="bench-num">539M</div><div class="bench-num">99.2M</div>
         </div>
         <div class="bench-row">
           <div class="bench-name">udp</div>
-          <div class="bench-track"><div class="bench-fill" style="width:51.9%"></div></div>
-          <div class="bench-num">480M</div><div class="bench-num na">—</div>
+          <div class="bench-track"><div class="bench-fill" style="width:76.0%"></div></div>
+          <div class="bench-num">532M</div><div class="bench-num">81.7M</div>
         </div>
         <div class="bench-row">
-          <div class="bench-name">icmp</div>
-          <div class="bench-track"><div class="bench-fill" style="width:47.5%"></div></div>
-          <div class="bench-num">439M</div><div class="bench-num na">—</div>
+          <div class="bench-name">ws</div>
+          <div class="bench-track"><div class="bench-fill" style="width:42.9%"></div></div>
+          <div class="bench-num">300M</div><div class="bench-num">79.2M</div>
+        </div>
+        <div class="bench-row">
+          <div class="bench-name">reverse-mux</div>
+          <div class="bench-track"><div class="bench-fill" style="width:33.3%"></div></div>
+          <div class="bench-num">233M</div><div class="bench-num na">FAIL</div>
         </div>
         <div class="bench-row dim">
           <div class="bench-name">hysteria</div>
-          <div class="bench-track"><div class="bench-fill" style="width:20.9%"></div></div>
-          <div class="bench-num">193M</div><div class="bench-num na">—</div>
+          <div class="bench-track"><div class="bench-fill" style="width:28.3%"></div></div>
+          <div class="bench-num">198M</div><div class="bench-num na">FAIL</div>
+        </div>
+        <div class="bench-row dim">
+          <div class="bench-name">tcp</div>
+          <div class="bench-track"><div class="bench-fill" style="width:9.9%"></div></div>
+          <div class="bench-num">69.6M</div><div class="bench-num">99.5M</div>
         </div>
       <p class="bench-note">
-        Kernel <code class="mono">gre</code> takes it at line-rate, with
-        <code class="mono">fou</code> (GRE hidden inside plain UDP) a whisker behind
-        while looking like ordinary traffic on the wire. This ISP polices neither TCP
-        nor arbitrary UDP, so the encrypted carriers all clear 500 Mbit too. This
-        capture predates the upload column, so its up cells read —.
+        One Iran relay to one foreign box, every transport built and torn down in
+        sequence. Download and upload disagree completely: kernel <code class="mono">gre</code>
+        wins the download at 700 Mbit yet returns nothing upstream, and
+        <code class="mono">fou</code> manages 641 down but collapses to 4.62 up. The one
+        transport that carries both is <code class="mono">icmp</code> — 624 down and
+        <strong>395 up, five times the 77.7 Mbit the raw path itself managed</strong>. A
+        download-only ranking would have picked exactly the wrong tunnel here.
       </p>
     </div>
 

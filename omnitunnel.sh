@@ -20,27 +20,27 @@
 # /etc/icmptun install (this tool never reads, edits or deletes that).
 set -euo pipefail
 
-VERSION="2.9.2"
+VERSION="2.9.3"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 
 ROOT_DIR="/etc/omnitunnel"
 INST_DIR="$ROOT_DIR/inst"
 PEER_DIR="$ROOT_DIR/peers"
-TSUITE_BIN="/usr/local/bin/omnitun"
+TSUITE_BIN="${OMNITUN_BIN:-/usr/local/bin/omnitun}"
 BINLINK="/usr/local/bin/omnitunnel"   # the 'omnitunnel' command (symlink to this script)
 # Hysteria2 is a separate Go engine (QUIC/UDP with the loss-agnostic "Brutal"
 # congestion control). We ship its static binary alongside our C core and drive
 # it through generated YAML - it is the stealthiest fast transport (looks like
 # HTTP/3, with salamander obfs + website masquerade).
-HYSTERIA_BIN="/usr/local/bin/hysteria"
+HYSTERIA_BIN="${OMNITUN_HYSTERIA_BIN:-/usr/local/bin/hysteria}"
 HY_MASQ_HOST="www.bing.com"
 # chisel (Go, jpillora/chisel) is the single-flow reverse MUX used to collapse
 # many relay->foreign user connections into ONE tunnelled flow (see the mux
 # section). A policed/lossy path shreds many parallel flows on upload but carries
 # one sustained flow fast+stable, so muxing recovers the full rate. Shipped static
 # alongside the core; pulled via raw like the rest.
-CHISEL_BIN="/usr/local/bin/chisel"
+CHISEL_BIN="${OMNITUN_CHISEL_BIN:-/usr/local/bin/chisel}"
 CHISEL_VER="1.10.1"
 # where the shipped per-arch binaries live (install.sh drops them here)
 ASSET_DIR="${OMNITUN_ASSETS:-/opt/omnitunnel}"
