@@ -20,7 +20,7 @@
 # /etc/icmptun install (this tool never reads, edits or deletes that).
 set -euo pipefail
 
-VERSION="2.9.4"
+VERSION="2.9.5"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 
@@ -251,6 +251,32 @@ forwarding_offenders() {
         i="${i#/proc/sys/net/ipv4/conf/}"; i="${i%/forwarding}"
         [[ "$i" == lo ]] && continue
         out+="$i "
+    done
+    printf '%s' "$out"
+}
+repair_all_forwarding() {
+    local k p
+    for k in $(forwarding_offenders); do
+        p="/proc/sys/net/ipv4/conf/$k/forwarding"
+        [[ -w "$p" ]] && printf '1\n' > "$p" 2>/dev/null || true
+    done
+    return 0
+}
+forwarding_conf_overrides() {
+    local base d f out="" seen=" " b
+    base="$(basename "$FWD_SYSCTL_FILE")"
+    for d in /etc/sysctl.d /run/sysctl.d /usr/local/lib/sysctl.d /usr/lib/sysctl.d /lib/sysctl.d; do
+        [[ -d "$d" ]] || continue
+        for f in "$d"/*.conf; do
+            [[ -e "$f" ]] || continue
+            b="$(basename "$f")"
+            [[ "$seen" == *" $b "* ]] && continue
+            seen+="$b "
+            [[ "$b" == "$base" ]] && continue
+            [[ "$b" > "$base" ]] || continue
+            grep -qE '^[[:space:]]*net\.ipv4\.(ip_forward|conf\.[^.]+\.forwarding)[[:space:]]*=' "$f" 2>/dev/null || continue
+            out+="$f "
+        done
     done
     printf '%s' "$out"
 }
@@ -551,6 +577,7 @@ apply_tuning() {
     modprobe tcp_bbr 2>/dev/null || true
     sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1 || true
     local i; for i in $(seq 1 40); do ip link show "$dev" >/dev/null 2>&1 && break; sleep 0.25; done
+    ensure_forwarding "$dev"
     ip link set "$dev" txqueuelen 1000 2>/dev/null || true
     if [[ "$shape" != none && -n "$shape" ]]; then
         tc qdisc replace dev "$dev" root tbf rate "$shape" burst 128kb latency 30ms 2>/dev/null || true
@@ -601,6 +628,7 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+ExecStartPre=-$SCRIPT_PATH _prefwd
 ExecStart=/bin/sh -c '$(kernel_up_cmd)'
 ExecStartPost=$SCRIPT_PATH _postup $1
 ExecStop=-/bin/sh -c '$(kernel_down_cmd)'
@@ -619,6 +647,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 ExecStartPre=-/sbin/ip link del $DEV
+ExecStartPre=-$SCRIPT_PATH _prefwd
 ExecStart=$(build_execstart)
 ExecStartPost=$SCRIPT_PATH _postup $1
 Restart=always
@@ -632,6 +661,7 @@ EOF
     systemctl daemon-reload || true
 }
 cmd_postup() { load_inst "$1"; apply_tuning "$DEV" "$SHAPE"; pf_apply_all "$1" || true; }
+cmd_prefwd() { ensure_forwarding "" >/dev/null 2>&1 || true; return 0; }
 
 # Restart an instance's port-forward relays. A tunnel restart silently kills the
 # sockets a relay held open through the OLD tunnel; if the relay is not bounced,
@@ -1738,7 +1768,7 @@ cmd_uninstall() {
         iptables -t nat -X "$ch" 2>/dev/null || true
     done
     # 4) core binaries + relay helper
-    rm -f "$TSUITE_BIN" "$HYSTERIA_BIN" "$HY_RELAY"
+    rm -f "$TSUITE_BIN" "$HYSTERIA_BIN" "$HY_RELAY" "$FWD_SYSCTL_FILE"
     # 5) state, the command symlink, then the install dir (this script lives there)
     rm -rf "$ROOT_DIR"
     rm -f "$BINLINK"
@@ -1868,6 +1898,10 @@ EOF
     if [[ -n "$off" ]]; then
         kv "IP forwarding:" "OFF on ${off% }" "$C_BRED"
         printf '  %b%s%b\n' "$C_BYEL" "forwards silently drop while this is off - fix with: omnitunnel fix-forwarding" "$C_RESET"
+    fi
+    local ovr; ovr="$(forwarding_conf_overrides)"
+    if [[ -n "$ovr" ]]; then
+        kv "Forwarding conf:" "overridden at boot by ${ovr% }" "$C_BYEL"
     fi
     rule_amber
     return 0
@@ -2058,15 +2092,23 @@ case "${1:-menu}" in
     mux-token)        need_root; cmd_mux_token "${2:?token}";;
     mux-off)          need_root; cmd_mux_off "${2:?instance}";;
     _postup)          cmd_postup "${2:?}";;
+    _prefwd)          cmd_prefwd;;
     _peercreate)      shift; cmd_peercreate "$@";;
     ensure-binary)    ensure_binary; ok "core ready at $TSUITE_BIN ($(arch_tag))";;
     fix-forwarding)   need_root; ensure_forwarding ""
-                      for n in $(list_instances); do load_inst "$n"; ensure_forwarding "$DEV"; done
+                      for n in $(list_instances); do
+                          inst_exists "$n" || continue
+                          load_inst "$n"; ensure_forwarding "$DEV"
+                      done
+                      repair_all_forwarding
                       off="$(forwarding_offenders)"
                       if persist_forwarding; then pmsg="persisted in $FWD_SYSCTL_FILE"
                       else pmsg="NOT persisted ($FWD_SYSCTL_FILE unwritable) - will reset on reboot"; fi
                       if [[ -z "$off" ]]; then ok "IP forwarding on for every interface; $pmsg"
-                      else warn "still off on: ${off% }; $pmsg"; fi;;
+                      else warn "could not turn it on for: ${off% }; $pmsg"; fi
+                      ovr="$(forwarding_conf_overrides)"
+                      [[ -n "$ovr" ]] && warn "these sysctl files are applied AFTER $FWD_SYSCTL_FILE and decide the value at boot: ${ovr% }"
+                      true;;
     update|upgrade)   need_root; cmd_update;;
     uninstall|purge)  need_root; cmd_uninstall;;
     version|-v|--version) echo "tunnelctl $VERSION (core: $($TSUITE_BIN version 2>/dev/null || echo n/a))";;
