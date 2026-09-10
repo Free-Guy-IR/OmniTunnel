@@ -20,7 +20,7 @@
 # /etc/icmptun install (this tool never reads, edits or deletes that).
 set -euo pipefail
 
-VERSION="2.9.3"
+VERSION="2.9.4"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 
@@ -211,6 +211,49 @@ svc_name() { echo "omnitun-$1.service"; }
 dnat_chain() { echo "TSUITE_$(echo "$1" | tr '[:lower:]-' '[:upper:]_')"; }
 gen_key() { head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n'; }
 default_local_ip() { ip -4 route get 1.1.1.1 2>/dev/null | grep -oE 'src [0-9.]+' | awk '{print $2}' | head -1; }
+default_wan_dev() { ip -4 route get 1.1.1.1 2>/dev/null | grep -oE 'dev [^ ]+' | awk '{print $2}' | head -1; }
+
+FWD_SYSCTL_FILE="/etc/sysctl.d/99-omnitunnel-forwarding.conf"
+FWD_SYSCTL_BODY='net.ipv4.ip_forward = 1
+net.ipv4.conf.all.forwarding = 1
+net.ipv4.conf.default.forwarding = 1'
+persist_forwarding() {
+    local cur tmp
+    cur="$(cat "$FWD_SYSCTL_FILE" 2>/dev/null || true)"
+    [[ "$cur" == "$FWD_SYSCTL_BODY" ]] && return 0
+    mkdir -p "$(dirname "$FWD_SYSCTL_FILE")" 2>/dev/null || return 1
+    tmp="$(mktemp "$FWD_SYSCTL_FILE.XXXXXX" 2>/dev/null)" || return 1
+    printf '%s\n' "$FWD_SYSCTL_BODY" > "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
+    chmod 644 "$tmp" 2>/dev/null || true
+    mv "$tmp" "$FWD_SYSCTL_FILE" 2>/dev/null || { rm -f "$tmp"; return 1; }
+    return 0
+}
+ensure_forwarding() {
+    local dev="${1:-}" wan k p
+    sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
+    sysctl -w net.ipv4.conf.all.forwarding=1 >/dev/null 2>&1 || true
+    sysctl -w net.ipv4.conf.default.forwarding=1 >/dev/null 2>&1 || true
+    wan="$(default_wan_dev || true)"
+    for k in "$wan" "$dev"; do
+        [[ -n "$k" ]] || continue
+        p="/proc/sys/net/ipv4/conf/$k/forwarding"
+        [[ -w "$p" ]] && printf '1\n' > "$p" 2>/dev/null || true
+    done
+    persist_forwarding || warn "could not persist forwarding to $FWD_SYSCTL_FILE - it will reset on reboot"
+    return 0
+}
+forwarding_offenders() {
+    local i f out=""
+    for i in /proc/sys/net/ipv4/conf/*/forwarding; do
+        [[ -r "$i" ]] || continue
+        f="$(cat "$i" 2>/dev/null)"
+        [[ "$f" == 0 ]] || continue
+        i="${i#/proc/sys/net/ipv4/conf/}"; i="${i%/forwarding}"
+        [[ "$i" == lo ]] && continue
+        out+="$i "
+    done
+    printf '%s' "$out"
+}
 
 load_inst() {
     local n="$1"; inst_exists "$n" || die "no such instance: $n"
@@ -501,7 +544,7 @@ hy_pf_reconcile() {
 # ------------------------------------------------------------- tuning ---------
 apply_tuning() {
     local dev="$1" shape="${2:-none}"
-    sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
+    ensure_forwarding "$dev"
     sysctl -w net.core.rmem_max=67108864 >/dev/null 2>&1 || true
     sysctl -w net.core.wmem_max=67108864 >/dev/null 2>&1 || true
     sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1 || true
@@ -1821,6 +1864,11 @@ EOF
     kv "Tunnels:" "$RUN running, $STOP stopped" "$([[ $RUN -gt 0 ]] && printf '%s' "$C_BGRN" || printf '%s' "$C_GREY")"
     kv "Port forwards:" "$fwd"
     kv "Core:" "$([[ -x "$TSUITE_BIN" ]] && echo Installed || echo missing)" "$([[ -x "$TSUITE_BIN" ]] && printf '%s' "$C_BGRN" || printf '%s' "$C_BRED")"
+    local off; off="$(forwarding_offenders)"
+    if [[ -n "$off" ]]; then
+        kv "IP forwarding:" "OFF on ${off% }" "$C_BRED"
+        printf '  %b%s%b\n' "$C_BYEL" "forwards silently drop while this is off - fix with: omnitunnel fix-forwarding" "$C_RESET"
+    fi
     rule_amber
     return 0
 }
@@ -2012,8 +2060,15 @@ case "${1:-menu}" in
     _postup)          cmd_postup "${2:?}";;
     _peercreate)      shift; cmd_peercreate "$@";;
     ensure-binary)    ensure_binary; ok "core ready at $TSUITE_BIN ($(arch_tag))";;
+    fix-forwarding)   need_root; ensure_forwarding ""
+                      for n in $(list_instances); do load_inst "$n"; ensure_forwarding "$DEV"; done
+                      off="$(forwarding_offenders)"
+                      if persist_forwarding; then pmsg="persisted in $FWD_SYSCTL_FILE"
+                      else pmsg="NOT persisted ($FWD_SYSCTL_FILE unwritable) - will reset on reboot"; fi
+                      if [[ -z "$off" ]]; then ok "IP forwarding on for every interface; $pmsg"
+                      else warn "still off on: ${off% }; $pmsg"; fi;;
     update|upgrade)   need_root; cmd_update;;
     uninstall|purge)  need_root; cmd_uninstall;;
     version|-v|--version) echo "tunnelctl $VERSION (core: $($TSUITE_BIN version 2>/dev/null || echo n/a))";;
-    *) echo "usage: $0 [menu|bench|add|list|status <n>|enable <n>|remove <n>|pf-add <n> <proto> <port>|pf-del <n> <port>|mux-add <n> <pubport> <dsthost> <dstport>|mux-del <n> <pubport>|mux-token <tok>|update|uninstall]";;
+    *) echo "usage: $0 [menu|bench|add|list|status <n>|enable <n>|remove <n>|pf-add <n> <proto> <port>|pf-del <n> <port>|mux-add <n> <pubport> <dsthost> <dstport>|mux-del <n> <pubport>|mux-token <tok>|fix-forwarding|update|uninstall]";;
 esac
