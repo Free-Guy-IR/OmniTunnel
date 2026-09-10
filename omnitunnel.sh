@@ -20,7 +20,7 @@
 # /etc/icmptun install (this tool never reads, edits or deletes that).
 set -euo pipefail
 
-VERSION="2.9.5"
+VERSION="2.9.6"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 
@@ -262,8 +262,26 @@ repair_all_forwarding() {
     done
     return 0
 }
+sets_forwarding_key() {
+    awk '
+        {
+            line = $0
+            sub(/^[[:space:]]+/, "", line)
+            if (line ~ /^[#;]/) next
+            eq = index(line, "=")
+            if (eq == 0) next
+            key = substr(line, 1, eq - 1)
+            sub(/[[:space:]]+$/, "", key)
+            sub(/^-/, "", key)
+            gsub(/\//, ".", key)
+            if (key == "net.ipv4.ip_forward") { hit = 1; exit }
+            if (key ~ /^net\.ipv4\.conf\..+\.forwarding$/) { hit = 1; exit }
+        }
+        END { exit(hit ? 0 : 1) }
+    ' "$1" 2>/dev/null
+}
 forwarding_conf_overrides() {
-    local base d f out="" seen=" " b
+    local LC_ALL=C base d f out="" seen=" " b
     base="$(basename "$FWD_SYSCTL_FILE")"
     for d in /etc/sysctl.d /run/sysctl.d /usr/local/lib/sysctl.d /usr/lib/sysctl.d /lib/sysctl.d; do
         [[ -d "$d" ]] || continue
@@ -274,11 +292,28 @@ forwarding_conf_overrides() {
             seen+="$b "
             [[ "$b" == "$base" ]] && continue
             [[ "$b" > "$base" ]] || continue
-            grep -qE '^[[:space:]]*net\.ipv4\.(ip_forward|conf\.[^.]+\.forwarding)[[:space:]]*=' "$f" 2>/dev/null || continue
+            sets_forwarding_key "$f" || continue
             out+="$f "
         done
     done
     printf '%s' "$out"
+}
+FWD_DROPIN_NAME="zz-omnitunnel-forwarding.conf"
+install_fwd_dropins() {
+    local u b d target body n=0
+    body="$(printf '[Service]\nExecStartPre=-%s _prefwd\n' "$SCRIPT_PATH")"
+    for u in /etc/systemd/system/omnitun-*.service; do
+        [[ -e "$u" ]] || continue
+        b="$(basename "$u")"
+        d="/etc/systemd/system/$b.d"
+        target="$d/$FWD_DROPIN_NAME"
+        [[ "$(cat "$target" 2>/dev/null || true)" == "$body" ]] && continue
+        mkdir -p "$d" 2>/dev/null || continue
+        printf '%s\n' "$body" > "$target" 2>/dev/null || continue
+        n=$((n+1))
+    done
+    [[ "$n" -gt 0 ]] && { systemctl daemon-reload 2>/dev/null || true; }
+    printf '%s' "$n"
 }
 
 load_inst() {
@@ -1769,6 +1804,7 @@ cmd_uninstall() {
     done
     # 4) core binaries + relay helper
     rm -f "$TSUITE_BIN" "$HYSTERIA_BIN" "$HY_RELAY" "$FWD_SYSCTL_FILE"
+    rm -rf /etc/systemd/system/omnitun-*.service.d
     # 5) state, the command symlink, then the install dir (this script lives there)
     rm -rf "$ROOT_DIR"
     rm -f "$BINLINK"
@@ -2106,6 +2142,8 @@ case "${1:-menu}" in
                       else pmsg="NOT persisted ($FWD_SYSCTL_FILE unwritable) - will reset on reboot"; fi
                       if [[ -z "$off" ]]; then ok "IP forwarding on for every interface; $pmsg"
                       else warn "could not turn it on for: ${off% }; $pmsg"; fi
+                      dn="$(install_fwd_dropins)"
+                      [[ "$dn" -gt 0 ]] && info "added the boot-time forwarding hook to $dn existing unit(s) - no restart needed"
                       ovr="$(forwarding_conf_overrides)"
                       [[ -n "$ovr" ]] && warn "these sysctl files are applied AFTER $FWD_SYSCTL_FILE and decide the value at boot: ${ovr% }"
                       true;;
