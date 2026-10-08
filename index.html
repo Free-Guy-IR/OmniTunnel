@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>OmniTunnel — benchmark ten transports, keep the winner</title>
-<meta name="description" content="Ten tunnel transports (gre, icmp, udp, tcp, mux, ws, hysteria, fou, vxlan, reverse-mux) in one manager. Benchmark them end-to-end on your own link, in both directions, and keep the winner.">
+<title>OmniTunnel — benchmark eleven transports, keep the winner</title>
+<meta name="description" content="Eleven tunnel transports (gre, icmp, udp, tcp, mux, ws, hysteria, fou, vxlan, reverse-mux, stripe) in one manager. Benchmark them end-to-end on your own link, in both directions, and keep the winner.">
 <style>
   :root {
     --bg: #0a0e14;
@@ -628,6 +628,18 @@
       link will land somewhere else — run it, keep the winner, re-run it whenever
       conditions change.
     </p>
+
+    <p class="bench-note">
+      A third shape is a route that <strong>byte-caps every connection</strong> — each
+      5-tuple carries a fixed budget (seen around ~8760&nbsp;B) and is then silently
+      blackholed, so every long-lived carrier dies after its first burst. The eleventh
+      transport, <code class="mono">stripe</code>, is built for exactly that: it shards
+      one flow across a rolling pool of short-lived connections, each retired before it
+      reaches the cap. So far it is proven in a local network namespace
+      (<strong>126 Mbit download-only, stable bidirectional</strong>); real byte-capped
+      Iran&rarr;foreign numbers are still being captured, so it is not yet in the
+      <code class="mono">bench</code> tables above.
+    </p>
   </section>
 
   <section id="how">
@@ -752,8 +764,9 @@ omnitunnel pf-del  main 8080
 omnitunnel mux-add main 443 127.0.0.1 443  <span class="comment"># single-flow muxed forward</span>
 
 <span class="comment"># a second, independent tunnel on the same box</span>
-omnitunnel add-auto   gre second &lt;foreign_ip&gt;
-omnitunnel add-manual gre second &lt;foreign_ip&gt;   <span class="comment"># no SSH: prints a token to paste abroad</span></div>
+omnitunnel add-auto   gre    second  &lt;foreign_ip&gt;
+omnitunnel add-manual gre    second  &lt;foreign_ip&gt;   <span class="comment"># no SSH: prints a token to paste abroad</span>
+omnitunnel add-auto   stripe striped &lt;foreign_ip&gt;   <span class="comment"># connection-striping TCP, for byte-capped paths</span></div>
     <p style="font-size:14px;">Full reference, architecture notes, and the source itself live in the <a href="https://github.com/Free-Guy-IR/OmniTunnel">repository</a>.</p>
   </section>
 

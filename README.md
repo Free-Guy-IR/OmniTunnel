@@ -6,20 +6,20 @@
 
 **A multi-protocol, obfuscated tunnel suite for bypassing per-destination
 traffic policing and DPI.** Prebuilt static binaries, one English
-menu-driven manager, ten interchangeable tunnel transports, and any
+menu-driven manager, eleven interchangeable tunnel transports, and any
 many-to-many topology you need.
 
 Built and hardened against real Iran ⇄ abroad conditions, where different ISPs
 police, throttle, or block traffic very differently depending on the transport
 and the destination datacenter. (Formerly the ICMP-only `icmptun` project —
-ICMP is now just one of the ten transports.)
+ICMP is now just one of the eleven transports.)
 
 ---
 
-## Why ten transports?
+## Why eleven transports?
 
 No single tunnel wins everywhere. What an ISP lets through — and how fast — is
-**per-route and per-transport**, and it changes. OmniTunnel ships all ten and
+**per-route and per-transport**, and it changes. OmniTunnel ships all eleven and
 lets you **benchmark them and keep the winner**:
 
 | Mode | What it is | Best when |
@@ -34,6 +34,7 @@ lets you **benchmark them and keep the winner**:
 | `fou`  | **GRE-in-UDP** (Foo-over-UDP), native kernel tunnel (no key) — a GRE tunnel wrapped inside an ordinary UDP packet on a port you choose | You want GRE's near-line-rate speed but the ISP blocks raw protocol-47, or the carrier must **look like plain UDP** instead of a GRE tunnel |
 | `vxlan` | **VXLAN**, native kernel tunnel (no key) — Ethernet-in-UDP, the standard datacenter overlay | A kernel UDP carrier that blends in as ordinary overlay traffic; useful where `fou`'s GRE-in-UDP is fingerprinted but VXLAN is not |
 | `reverse-mux` | **ICMP echo-*reply* + single-flow MUX** (no key) — the icmp engine with the emitted echo type forced to reply, plus a chisel reverse tunnel that collapses every user connection into **one** flow | The relay→foreign **upload** is policed: many parallel connections get shredded (they collapse to a few Mbit) while a single sustained flow stays near line-rate. Also dodges paths that drop echo-*request* (type 8) in one direction but pass echo-*reply* (type 0) |
+| `stripe` | **Connection-striping TCP** (no key) — shards one flow across many fresh, short-lived connections so no single 5-tuple is ever kept alive long enough to be capped | The ISP **byte-caps each 5-tuple** (e.g. ~8760 B, then the connection is silently blackholed): a single long-lived TCP stream dies after a few KB, so `stripe` keeps spreading the flow over a rolling pool of brand-new connections and no one of them reaches the cap |
 
 Many ISPs police only the *common* transports (TCP/UDP) and pass the "tunnel"
 protocols — GRE (IP proto 47) and ICMP — at the link's real physical rate. On
@@ -92,7 +93,7 @@ From the main menu choose **“Benchmark all tunnels & pick the best.”** Point
 at a foreign server (IP + SSH login) and it will:
 
 1. measure the **raw** path (download, upload + rtt),
-2. bring up each of the ten tunnels in turn and measure **download, upload,
+2. bring up each of the eleven tunnels in turn and measure **download, upload,
    packet loss and ping** through it,
 3. print a comparison table,
 4. **remove every test tunnel from both sides**, then let you keep exactly one
@@ -162,6 +163,29 @@ benchmark measures both directions rather than download alone.
 On the very same path, raw ICMP echo-*request* (type 8) was **100 % dropped**
 while echo-*reply* (type 0) passed untouched — the directional, type-specific
 block `reverse-mux` is built to walk around.
+
+### The third shape: a route that byte-caps every connection
+
+A newer failure mode some ISPs apply is a **per-5-tuple byte cap**: each
+connection is allowed to carry a fixed budget (observed around **~8760 B**) and
+is then silently blackholed — no RST, the flow just stops. Every long-lived
+carrier (`tcp`, `mux`, `ws`, even the kernel tunnels) dies after that first
+budget, because each of their connections is meant to live for the whole
+session. `stripe` is the transport for exactly this path: it shards the flow
+across a rolling pool of short-lived connections and retires each one well
+before it reaches the cap, so the policer never has a long-lived 5-tuple to
+punish.
+
+| what was measured | result |
+|---|---|
+| `stripe`, local network-namespace loopback proof, download-only | **126 Mbit** |
+| `stripe`, local netns, bidirectional | **stable** (no stall, no collapse) |
+| `stripe`, real byte-capped Iran→foreign path | **pending** — numbers not yet captured |
+
+These are a **local-netns functional proof only** — they show the transport
+sustains throughput without hitting a cap, not a real-link figure. Real-path
+numbers on a genuinely byte-capped route are still to be measured; `stripe` is
+not yet part of the headline `omnitunnel bench` comparison above.
 
 ---
 
@@ -252,6 +276,54 @@ omnitun udp  ...     omnitun tcp  ...     omnitun icmp ...
 
 `-s` marks the server (listening) side; the client omits it.
 
+### Creating a `stripe` tunnel
+
+`stripe` is created the same way as any other transport — pick it in the
+interactive wizard or name it on the CLI:
+
+```bash
+omnitunnel add                                       # wizard -> choose "stripe"
+omnitunnel add-auto stripe main <foreign-ip> [N]     # N = striping workers (default 90)
+omnitunnel add-manual stripe main <foreign-ip> [N]   # no SSH: prints a token to paste abroad
+```
+
+The wizard asks only for the number of **striping connection workers N**
+(default 90); subnet, port and the port-count pool are allocated for you. It
+uses **no key** (the inner proxy traffic is already encrypted) and, like every
+other transport, never touches the box's own SSH or port 22.
+
+Unlike the other transports `stripe` runs on its **own static engine**
+(`omnistripe`, a separate Go binary in [`bin/`](bin/)), so it is driven directly
+through that binary rather than through `omnitun`:
+
+```bash
+omnistripe -L <local-ip> -R <peer-ip> -A <local-tun-ip> -P <peer-tun-ip> \
+           -p 40000 -C 400 -N 90 -T tsstripe0 -M 1400 [-s]
+```
+
+Flags:
+
+| flag | meaning | default |
+|------|---------|---------|
+| `-L` | local source/bind IP | — |
+| `-R` | peer IP the client dials | — |
+| `-A` | this box's tun address | — |
+| `-P` | peer's tun address | — |
+| `-p` | base destination port of the striped pool | `40000` |
+| `-C` | number of destination ports in the pool | `400` |
+| `-N` | connection (striping) workers | `90` |
+| `-dl` | download-side pool size | `0` (derive from `-N`) |
+| `-T` | tun device name | `tsstripe0` |
+| `-M` | tun MTU | `1400` |
+| `-s` | run as the server (listener) side; the client omits it | off |
+| `-u` | client→server chunk bytes | `6800` |
+| `-d` | server→client chunk bytes | `8600` |
+
+`-u`/`-d` set how much data each striped connection carries before it is
+retired. They are **hard-capped at 8656 bytes** (the on-wire ceiling of 8760 B
+minus the 104-byte frame header); any larger value is clamped down to 8656, so
+no single connection ever outlives a ~8760 B per-5-tuple byte cap.
+
 ---
 
 ## Updating & removing
@@ -295,6 +367,13 @@ tun devices and iptables chains, the core binaries, all state under
   and **never restarts the engine or disturbs the live QUIC session or other
   forwards** (UDP forwards are the one exception and still live in-config). No
   tun device or iptables DNAT is used for this type.
+- **Bundled `omnistripe` engine** — the `stripe` transport is powered by its own
+  self-contained static Go binary ([`src/omnistripe`](src/omnistripe)), shipped
+  in [`bin/`](bin/) for both CPUs as `omnistripe-amd64` / `omnistripe-arm64`. It
+  owns a `tsstripe*` tun device and shards the inner flow across a rolling pool
+  of short-lived TCP connections (base port `-p`, `-C` ports wide), each retired
+  before it reaches the per-5-tuple byte cap. Like the C core it needs no shared
+  libraries and cross-compiles trivially.
 - Prebuilt for **amd64** and **arm64** under [`bin/`](bin/), also attached to
   each release.
 - **`omnitunnel.sh`** — the English TUI manager: benchmark, instance
