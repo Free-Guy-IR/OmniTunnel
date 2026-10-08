@@ -20,7 +20,7 @@
 # /etc/icmptun install (this tool never reads, edits or deletes that).
 set -euo pipefail
 
-VERSION="2.9.6"
+VERSION="2.9.7"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 
@@ -42,6 +42,7 @@ HY_MASQ_HOST="www.bing.com"
 # alongside the core; pulled via raw like the rest.
 CHISEL_BIN="${OMNITUN_CHISEL_BIN:-/usr/local/bin/chisel}"
 CHISEL_VER="1.10.1"
+OMNISTRIPE_BIN="${OMNITUN_STRIPE_BIN:-/usr/local/bin/omnistripe}"
 # where the shipped per-arch binaries live (install.sh drops them here)
 ASSET_DIR="${OMNITUN_ASSETS:-/opt/omnitunnel}"
 RAW_BASE="https://raw.githubusercontent.com/Free-Guy-IR/OmniTunnel/main"
@@ -167,8 +168,27 @@ ensure_chisel() {
     install -m 0755 "$cand" "$CHISEL_BIN"
 }
 
+omnistripe_local_bin() {
+    local a="$1" d
+    for d in "$ASSET_DIR/bin" "$SCRIPT_DIR/bin"; do [[ -f "$d/omnistripe-$a" ]] && { echo "$d/omnistripe-$a"; return 0; }; done
+    return 1
+}
+ensure_omnistripe() {
+    [[ -x "$OMNISTRIPE_BIN" ]] && return 0
+    local a; a="$(arch_tag)"; [[ "$a" == unknown ]] && die "unsupported CPU: $(uname -m)"
+    local cand; cand="$(omnistripe_local_bin "$a" || true)"
+    if [[ -z "$cand" ]]; then
+        info "  fetching omnistripe core for $a ..."
+        mkdir -p "$ASSET_DIR/bin"
+        curl -fsSL -o "$ASSET_DIR/bin/omnistripe-$a" "$RAW_BASE/bin/omnistripe-$a" \
+            || die "could not obtain omnistripe-$a (no shipped copy and download failed)"
+        chmod +x "$ASSET_DIR/bin/omnistripe-$a"; cand="$ASSET_DIR/bin/omnistripe-$a"
+    fi
+    install -m 0755 "$cand" "$OMNISTRIPE_BIN"
+}
+
 # ------------------------------------------------------------ type registry ---
-ALL_TYPES="gre icmp udp mux ws hysteria tcp fou vxlan reverse-mux"
+ALL_TYPES="gre icmp udp mux ws hysteria tcp fou vxlan reverse-mux stripe"
 type_desc() {
     case "$1" in
         gre)      echo "IP-over-GRE  (kernel; often unpoliced & full line-rate)";;
@@ -181,11 +201,12 @@ type_desc() {
         fou)      echo "GRE-in-UDP  (kernel; GRE hidden inside plain UDP on its port)";;
         vxlan)    echo "VXLAN L2-over-UDP  (kernel; Ethernet inside UDP)";;
         reverse-mux) echo "ICMP-reply + single-flow MUX  (Iran->foreign relay: beats policed multi-flow UPLOAD)";;
+        stripe)   echo "connection-striping TCP  (shards one flow across fresh short-lived conns; beats per-5-tuple byte caps)";;
         *) echo "";;
     esac
 }
 # gre/icmp/fou/vxlan are kernel/plaintext carriers - no PSK; reverse-mux rides icmp (no PSK either)
-type_uses_key() { [[ "$1" != icmp && "$1" != gre && "$1" != fou && "$1" != vxlan && "$1" != reverse-mux ]]; }
+type_uses_key() { [[ "$1" != icmp && "$1" != gre && "$1" != fou && "$1" != vxlan && "$1" != reverse-mux && "$1" != stripe ]]; }
 # reverse-mux is icmp(reply)-under-the-hood + a chisel single-flow MUX layer
 type_is_revmux() { [[ "$1" == reverse-mux ]]; }
 # native kernel tunnels - no compiled core binary involved
@@ -196,10 +217,11 @@ type_is_kernel() { [[ "$1" == gre || "$1" == fou || "$1" == vxlan ]]; }
 # bit the plain `udp` transport too). gre's "port" is only a GRE key, and
 # tcp/mux/ws are TCP, so those are unaffected and stay at 51820. hysteria runs its
 # own QUIC/443 masquerade and manages its own port.
-port_base() { case "$1" in udp|fou|vxlan) echo 28820;; *) echo 51820;; esac; }
+port_base() { case "$1" in udp|fou|vxlan) echo 28820;; stripe) echo 40000;; *) echo 51820;; esac; }
 # hysteria is a separate engine: its own binary + YAML, no tun device, forwards
 # ports natively (no iptables DNAT). It gets special-cased throughout.
 type_is_hysteria() { [[ "$1" == hysteria ]]; }
+type_is_stripe() { [[ "$1" == stripe ]]; }
 
 # ------------------------------------------------------------ instance i/o ----
 inst_path() { echo "$INST_DIR/$1"; }
@@ -318,14 +340,14 @@ install_fwd_dropins() {
 
 load_inst() {
     local n="$1"; inst_exists "$n" || die "no such instance: $n"
-    TYPE=""; ROLE=""; LOCAL_IP=""; PEER_IP=""; TUN_ADDR=""; PEER_ADDR=""; PORT=""; KEY=""; DEV=""; MTU="1400"; NCONN="16"; SHAPE="none"; ICMP_MODE=""
+    TYPE=""; ROLE=""; LOCAL_IP=""; PEER_IP=""; TUN_ADDR=""; PEER_ADDR=""; PORT=""; KEY=""; DEV=""; MTU="1400"; NCONN="16"; SHAPE="none"; ICMP_MODE=""; PCOUNT="400"
     # shellcheck disable=SC1090
     source "$(inst_conf "$n")"; INAME="$n"
 }
 
 # create NAME TYPE ROLE LOCAL PEER PORT KEY TUN_ADDR PEER_ADDR [SHAPE] [NCONN]
 create_inst() {
-    local n="$1" t="$2" role="$3" lip="$4" pip="$5" port="$6" key="$7" ta="$8" pa="$9" shape="${10:-none}" nc="${11:-16}" imode="${12:-}"
+    local n="$1" t="$2" role="$3" lip="$4" pip="$5" port="$6" key="$7" ta="$8" pa="$9" shape="${10:-none}" nc="${11:-16}" imode="${12:-}" pcount="${13:-400}"
     # reverse-mux IS icmp with the reply-type forced (its whole point is the
     # reply-gated dodge), so default its ICMP_MODE to reply if unset.
     [[ "$t" == reverse-mux && -z "$imode" ]] && imode=reply
@@ -346,6 +368,7 @@ MTU=1400
 NCONN=$nc
 SHAPE=$shape
 ICMP_MODE=$imode
+PCOUNT=$pcount
 EOF
 }
 
@@ -386,6 +409,7 @@ build_execstart() {
         # reverse-mux rides the icmp engine with the reply type forced; the chisel
         # MUX layer lives in separate units (mux-add / mux-token), not here.
         reverse-mux) echo "$TSUITE_BIN icmp -L $LOCAL_IP -R $PEER_IP -A $TUN_ADDR -P $PEER_ADDR -I 4d54 -T $DEV -M $MTU$sflag -r ${ICMP_MODE:-reply}";;
+        stripe) echo "$OMNISTRIPE_BIN -L $LOCAL_IP -R $PEER_IP -A $TUN_ADDR -P $PEER_ADDR -p $PORT -C ${PCOUNT:-400} -N $NCONN -T $DEV -M $MTU$sflag";;
     esac
 }
 
@@ -629,6 +653,7 @@ apply_tuning() {
 write_service() {
     load_inst "$1"
     if type_is_hysteria "$TYPE"; then ensure_hysteria
+    elif type_is_stripe "$TYPE"; then ensure_omnistripe
     elif ! type_is_kernel "$TYPE"; then ensure_binary; fi
     local unit="/etc/systemd/system/$(svc_name "$1")"
     if type_is_hysteria "$TYPE"; then
@@ -688,6 +713,7 @@ ExecStartPost=$SCRIPT_PATH _postup $1
 Restart=always
 RestartSec=3
 TimeoutStopSec=5
+LimitNOFILE=1048576
 
 [Install]
 WantedBy=multi-user.target
@@ -1218,6 +1244,11 @@ provision_peer() {
         [[ -n "$hbin" ]] || die "no hysteria-$parch binary to send to peer"
         peer_scp "$h" "$hbin" "/opt/omnitunnel/bin/hysteria-$parch"
         peer_ssh "$h" "chmod +x /opt/omnitunnel/bin/hysteria-$parch; install -m0755 /opt/omnitunnel/bin/hysteria-$parch /usr/local/bin/hysteria"
+    elif type_is_stripe "$t"; then
+        local sbin; sbin="$(omnistripe_local_bin "$parch" || true)"
+        [[ -n "$sbin" ]] || die "no omnistripe-$parch binary to send to peer"
+        peer_scp "$h" "$sbin" "/opt/omnitunnel/bin/omnistripe-$parch"
+        peer_ssh "$h" "chmod +x /opt/omnitunnel/bin/omnistripe-$parch; install -m0755 /opt/omnitunnel/bin/omnistripe-$parch /usr/local/bin/omnistripe"
     else
         local pbin=""
         for d in "$ASSET_DIR/bin" "$SCRIPT_DIR/bin"; do [[ -f "$d/omnitun-$parch" ]] && pbin="$d/omnitun-$parch" && break; done
@@ -1230,8 +1261,9 @@ provision_peer() {
 cmd_peercreate() {
     need_root
     if type_is_hysteria "$2"; then ensure_hysteria
+    elif type_is_stripe "$2"; then ensure_omnistripe
     elif ! type_is_kernel "$2"; then ensure_binary; fi
-    create_inst "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" "${10}" "${11}" "${12:-}"
+    create_inst "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" "${10}" "${11}" "${12:-}" "${13:-400}"
     inst_enable "$1" >/dev/null 2>&1 || true; ok "peer instance '$1' up"
 }
 
@@ -1352,6 +1384,8 @@ wizard_add() {
         read -erp "Download shaper rate to stabilise (e.g. 90mbit / none) [none]: " shape; shape="${shape:-none}"
     elif [[ "$t" == hysteria ]]; then
         read -erp "Brutal-CC target bandwidth in mbps (higher pushes harder through loss) [200]: " shape; shape="${shape:-200}"
+    elif [[ "$t" == stripe ]]; then
+        read -erp "Striping connection workers N [90]: " nc; nc="${nc:-90}"
     fi
     # collision-safe allocation vs whatever the foreign already runs (see cmd_add_auto)
     local fsub fport fnames
@@ -1394,6 +1428,8 @@ wizard_add_manual() {
     if [[ "$t" == mux ]]; then
         read -erp "Parallel links N [16]: " nc; nc="${nc:-16}"
         read -erp "Download shaper rate (e.g. 90mbit / none) [none]: " shape; shape="${shape:-none}"
+    elif [[ "$t" == stripe ]]; then
+        read -erp "Striping connection workers N [90]: " nc; nc="${nc:-90}"
     fi
     cmd_add_manual "$t" "$kn" "$fhost" "$nc" "$shape" "$mylip"
 }

@@ -30,7 +30,7 @@ OLD_VER="$(ver_of "$DEST/omnitunnel.sh" 2>/dev/null || true)"
 # checksum the installed core binaries BEFORE we overwrite them, so we only
 # restart running tunnels if the core actually changed - a script-only update
 # must not needlessly bounce a production tunnel.
-OLD_CORE="$(sum_of /usr/local/bin/omnitun)"; OLD_HY="$(sum_of /usr/local/bin/hysteria)"
+OLD_CORE="$(sum_of /usr/local/bin/omnitun)"; OLD_HY="$(sum_of /usr/local/bin/hysteria)"; OLD_STRIPE="$(sum_of /usr/local/bin/omnistripe)"
 [[ -n "$OLD_VER" ]] && echo "OmniTunnel: found existing install v$OLD_VER ($ARCH), checking for updates..." \
                     || echo "OmniTunnel installer - CPU arch: $ARCH"
 
@@ -63,6 +63,7 @@ if [[ -f "$(dirname "$0")/bin/omnitun-$ARCH" ]]; then
     cp "$SRC/omnitunnel.sh" "$DEST/omnitunnel.sh"
     [[ -f "$SRC/bin/hysteria-$ARCH" ]] && cp "$SRC/bin/hysteria-$ARCH" "$DEST/bin/hysteria-$ARCH"
     [[ -f "$SRC/bin/chisel-$ARCH" ]] && cp "$SRC/bin/chisel-$ARCH" "$DEST/bin/chisel-$ARCH"
+    [[ -f "$SRC/bin/omnistripe-$ARCH" ]] && cp "$SRC/bin/omnistripe-$ARCH" "$DEST/bin/omnistripe-$ARCH"
 else
     echo "downloading core + manager ..."
     # Cache-bust the raw CDN. A stale Fastly edge can otherwise hand back the
@@ -75,6 +76,7 @@ else
     curl -fsSL "${NOCACHE[@]}" "$RAW/omnitunnel.sh$CB"      -o "$DEST/omnitunnel.sh"
     curl -fsSL "${NOCACHE[@]}" "$RAW/bin/hysteria-$ARCH$CB" -o "$DEST/bin/hysteria-$ARCH" || true
     curl -fsSL "${NOCACHE[@]}" "$RAW/bin/chisel-$ARCH$CB"   -o "$DEST/bin/chisel-$ARCH" || true
+    curl -fsSL "${NOCACHE[@]}" "$RAW/bin/omnistripe-$ARCH$CB" -o "$DEST/bin/omnistripe-$ARCH" || true
 fi
 
 bash -n "$DEST/omnitunnel.sh" 2>/dev/null || { echo "downloaded omnitunnel.sh is not a valid script (bad mirror / captive portal?) - aborting"; exit 1; }
@@ -83,11 +85,12 @@ chmod +x "$DEST/bin/omnitun-$ARCH" "$DEST/omnitunnel.sh"
 install -m 0755 "$DEST/bin/omnitun-$ARCH" /usr/local/bin/omnitun
 [[ -f "$DEST/bin/hysteria-$ARCH" ]] && { chmod +x "$DEST/bin/hysteria-$ARCH"; install -m 0755 "$DEST/bin/hysteria-$ARCH" /usr/local/bin/hysteria; }
 [[ -s "$DEST/bin/chisel-$ARCH" ]] && { chmod +x "$DEST/bin/chisel-$ARCH"; install -m 0755 "$DEST/bin/chisel-$ARCH" /usr/local/bin/chisel; }
+[[ -s "$DEST/bin/omnistripe-$ARCH" ]] && { chmod +x "$DEST/bin/omnistripe-$ARCH"; install -m 0755 "$DEST/bin/omnistripe-$ARCH" /usr/local/bin/omnistripe; }
 ln -sf "$DEST/omnitunnel.sh" "$BINLINK"
 
 NEW_VER="$(ver_of "$DEST/omnitunnel.sh" || true)"
-NEW_CORE="$(sum_of /usr/local/bin/omnitun)"; NEW_HY="$(sum_of /usr/local/bin/hysteria)"
-core_changed=0; [[ "$OLD_CORE" != "$NEW_CORE" || "$OLD_HY" != "$NEW_HY" ]] && core_changed=1
+NEW_CORE="$(sum_of /usr/local/bin/omnitun)"; NEW_HY="$(sum_of /usr/local/bin/hysteria)"; NEW_STRIPE="$(sum_of /usr/local/bin/omnistripe)"
+core_changed=0; [[ "$OLD_CORE" != "$NEW_CORE" || "$OLD_HY" != "$NEW_HY" || "$OLD_STRIPE" != "$NEW_STRIPE" ]] && core_changed=1
 
 echo
 if [[ -z "$OLD_VER" ]]; then
