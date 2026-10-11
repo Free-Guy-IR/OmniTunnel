@@ -20,7 +20,7 @@
 # /etc/icmptun install (this tool never reads, edits or deletes that).
 set -euo pipefail
 
-VERSION="2.9.9"
+VERSION="2.9.10"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 
@@ -1657,6 +1657,13 @@ bench_run() {
     mylip="$(default_local_ip)"; read -erp "This box public IP [$mylip]: " x; mylip="${x:-$mylip}"
     guard_peer_downgrade "$fhost"
     command -v iperf3 >/dev/null || { warn "installing iperf3..."; apt-get install -y iperf3 >/dev/null 2>&1 || yum install -y iperf3 >/dev/null 2>&1 || true; }
+    command -v iperf3 >/dev/null || {
+        echo
+        warn "iperf3 is missing on THIS box and could not be auto-installed (apt may be in a broken state)."
+        echo "  The benchmark can't measure without it. Install iperf3 here (fix apt, or drop a static iperf3),"
+        echo "  then run the benchmark again."
+        return 1
+    }
 
     # deploy core + iperf3 server on the far side
     if ! peer_ssh "$fhost" true >/dev/null 2>&1; then
@@ -1855,6 +1862,13 @@ cmd_bench_manual() {
     local fhost="$1" mylip="${2:-$(default_local_ip)}"
     [[ -n "$fhost" ]] || die "usage: bench-manual <foreign_ip> [my_ip]"
     command -v iperf3 >/dev/null || { warn "installing iperf3..."; apt-get install -y iperf3 >/dev/null 2>&1 || true; }
+    command -v iperf3 >/dev/null || {
+        echo
+        warn "iperf3 is missing on THIS box and could not be auto-installed (apt may be in a broken state)."
+        echo "  The benchmark can't measure without it. Install iperf3 here (fix apt, or drop a static iperf3),"
+        echo "  then run the benchmark again."
+        return 1
+    }
     local ku km kt; ku=$(gen_key); km=$(gen_key); kt=$(gen_key)
     B_KUDP=$ku B_KMUX=$km B_KTCP=$kt
     local token; token=$(printf 'bench|%s|%s|%s|%s|%s' "$fhost" "$mylip" "$ku" "$km" "$kt" | base64 | tr -d '\n')
