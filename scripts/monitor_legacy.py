@@ -16,6 +16,12 @@ def list_instances():
     return [n for n in names if os.path.isfile(os.path.join(INST_DIR, n, 'instance.conf'))]
 
 
+def strip_quotes(val):
+    if len(val) >= 2 and val[0] == val[-1] and val[0] in ('"', "'"):
+        return val[1:-1]
+    return val
+
+
 def conf_values(inst):
     out = {}
     path = os.path.join(INST_DIR, inst, 'instance.conf')
@@ -25,7 +31,7 @@ def conf_values(inst):
                 line = line.strip()
                 if '=' in line and not line.startswith('#'):
                     key, _, val = line.partition('=')
-                    out[key] = val
+                    out[key] = strip_quotes(val)
     except OSError:
         pass
     return out

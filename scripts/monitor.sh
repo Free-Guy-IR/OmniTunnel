@@ -20,10 +20,23 @@ list_instances() {
     done
 }
 
+strip_quotes() {
+    local v="$1" n
+    n=${#v}
+    if (( n >= 2 )); then
+        local f="${v:0:1}" l="${v:n-1:1}"
+        if { [[ "$f" == '"' && "$l" == '"' ]]; } || { [[ "$f" == "'" && "$l" == "'" ]]; }; then
+            v="${v:1:n-2}"
+        fi
+    fi
+    printf '%s\n' "$v"
+}
+
 conf_val() {
-    local c="$INST_DIR/$1/instance.conf" key="$2"
+    local c="$INST_DIR/$1/instance.conf" key="$2" v
     [[ -f "$c" ]] || return 0
-    grep -m1 -oE "^${key}=.*" "$c" 2>/dev/null | cut -d= -f2-
+    v="$(grep -m1 -oE "^${key}=.*" "$c" 2>/dev/null | cut -d= -f2-)"
+    strip_quotes "$v"
 }
 
 counter() { cat "/sys/class/net/$1/statistics/$2" 2>/dev/null || echo 0; }

@@ -23,10 +23,23 @@ advisory only: no guaranteed throughput improvement; measure before and after.
 EOF
 }
 
+strip_quotes() {
+    local v="$1" n
+    n=${#v}
+    if (( n >= 2 )); then
+        local f="${v:0:1}" l="${v:n-1:1}"
+        if { [[ "$f" == '"' && "$l" == '"' ]]; } || { [[ "$f" == "'" && "$l" == "'" ]]; }; then
+            v="${v:1:n-2}"
+        fi
+    fi
+    printf '%s\n' "$v"
+}
+
 conf_val() {
-    local c="$INST_DIR/$1/instance.conf" key="$2"
+    local c="$INST_DIR/$1/instance.conf" key="$2" v
     [[ -f "$c" ]] || return 0
-    grep -m1 -oE "^${key}=.*" "$c" 2>/dev/null | cut -d= -f2-
+    v="$(grep -m1 -oE "^${key}=.*" "$c" 2>/dev/null | cut -d= -f2-)"
+    strip_quotes "$v"
 }
 
 dev_of() { conf_val "$1" DEV; }
@@ -136,7 +149,7 @@ cmd_dry_run() {
 }
 
 cmd_apply() {
-    local inst="$1" ack="$2" dev before after snap created_snap reread
+    local inst="$1" ack="$2" dev dev2 before after snap created_snap reread orig_before
     [[ -n "$inst" ]] || die "apply needs an instance"
     dev="$(dev_of "$inst")"
     [[ -n "$dev" ]] || die "instance $inst has no DEV"
@@ -146,6 +159,11 @@ cmd_apply() {
     mkdir -p "$STATE_DIR"
     exec 9>"$STATE_DIR/$dev.lock"
     flock -x 9
+    dev2="$(dev_of "$inst")"
+    [[ "$dev2" == "$dev" ]] || die "instance $inst DEV changed under lock (was '$dev', now '${dev2:-<none>}'); aborting without mutation"
+    [[ -n "$dev2" ]] || die "instance $inst has no DEV under lock"
+    dev_allowed "$dev2" || die "refusing to mutate '$dev2' under lock: not an OmniTunnel TUN device"
+    dev_exists "$dev2" || die "device $dev2 not present under lock"
     before="$(cur_txqlen "$dev")"
     [[ -n "$before" ]] || die "cannot read current txqueuelen for $dev"
     snap="$STATE_DIR/$dev.txqlen"
@@ -172,11 +190,14 @@ cmd_apply() {
         fi
         die "apply did not take on $dev; revert incomplete (current=${reread:-unknown}, original=$before); snapshot kept at $snap for manual recovery"
     fi
+    orig_before="$(sed -n 1p "$snap" 2>/dev/null)"
+    [[ -n "$orig_before" ]] || orig_before="$before"
+    printf '%s\n%s\n' "$orig_before" "$after" > "$snap"
     echo "applied: $dev txqueuelen $before -> $after  (rollback: optimizer.sh rollback $inst)"
 }
 
 cmd_rollback() {
-    local inst="$1" dev snap before reread
+    local inst="$1" dev snap before applied cur reread
     [[ -n "$inst" ]] || die "rollback needs an instance"
     dev="$(dev_of "$inst")"
     [[ -n "$dev" ]] || die "instance $inst has no DEV"
@@ -186,9 +207,16 @@ cmd_rollback() {
     flock -x 9
     snap="$STATE_DIR/$dev.txqlen"
     [[ -f "$snap" ]] || die "no snapshot for $dev ($snap); nothing to roll back"
-    before="$(cat "$snap")"
+    before="$(sed -n 1p "$snap")"
+    applied="$(sed -n 2p "$snap")"
     [[ "$before" =~ ^[0-9]+$ ]] || die "corrupt snapshot $snap"
     dev_exists "$dev" || die "device $dev not present"
+    if [[ "$applied" =~ ^[0-9]+$ ]]; then
+        cur="$(cur_txqlen "$dev")"
+        if [[ "$cur" != "$applied" ]]; then
+            die "device $dev drifted since apply: current=${cur:-unknown} expected-applied=$applied; refusing to clobber; remove $snap manually if the rollback is intended"
+        fi
+    fi
     set_txqlen "$dev" "$before" || die "rollback failed on $dev"
     reread="$(cur_txqlen "$dev")"
     [[ "$reread" == "$before" ]] || die "rollback did not take on $dev (current=${reread:-unknown}, wanted $before); snapshot kept at $snap for manual recovery"

@@ -3,12 +3,24 @@ set -uo pipefail
 INST_DIR="${OMNITUN_INST_DIR:-/etc/omnitunnel/inst}"
 RUN_DIR="${OMNITUN_RUN_DIR:-/run/omnitunnel}"
 
+strip_quotes() {
+    local v="$1" n
+    n=${#v}
+    if (( n >= 2 )); then
+        local f="${v:0:1}" l="${v:n-1:1}"
+        if { [[ "$f" == '"' && "$l" == '"' ]]; } || { [[ "$f" == "'" && "$l" == "'" ]]; }; then
+            v="${v:1:n-2}"
+        fi
+    fi
+    printf '%s\n' "$v"
+}
+
 inst="${1:-}"
 dev=""
 if [[ -n "$inst" ]]; then
     conf="$INST_DIR/$inst/instance.conf"
     [[ -f "$conf" ]] || { echo "no such instance: $inst" >&2; exit 1; }
-    dev="$(grep -m1 -oE '^DEV=.*' "$conf" | cut -d= -f2- | tr -d '"'\''')"
+    dev="$(strip_quotes "$(grep -m1 -oE '^DEV=.*' "$conf" | cut -d= -f2-)")"
 fi
 
 sec() { printf '\n===== %s =====\n' "$1"; }
