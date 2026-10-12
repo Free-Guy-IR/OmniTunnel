@@ -197,7 +197,7 @@ cmd_apply() {
 }
 
 cmd_rollback() {
-    local inst="$1" dev snap before applied cur reread
+    local inst="$1" dev dev2 snap before applied cur reread
     [[ -n "$inst" ]] || die "rollback needs an instance"
     dev="$(dev_of "$inst")"
     [[ -n "$dev" ]] || die "instance $inst has no DEV"
@@ -205,12 +205,16 @@ cmd_rollback() {
     mkdir -p "$STATE_DIR"
     exec 9>"$STATE_DIR/$dev.lock"
     flock -x 9
+    dev2="$(dev_of "$inst")"
+    [[ "$dev2" == "$dev" ]] || die "instance $inst DEV changed under lock (was '$dev', now '${dev2:-<none>}'); aborting without mutation"
+    [[ -n "$dev2" ]] || die "instance $inst has no DEV under lock"
+    dev_allowed "$dev2" || die "refusing to roll back '$dev2' under lock: not an OmniTunnel TUN device"
+    dev_exists "$dev2" || die "device $dev2 not present under lock"
     snap="$STATE_DIR/$dev.txqlen"
     [[ -f "$snap" ]] || die "no snapshot for $dev ($snap); nothing to roll back"
     before="$(sed -n 1p "$snap")"
     applied="$(sed -n 2p "$snap")"
     [[ "$before" =~ ^[0-9]+$ ]] || die "corrupt snapshot $snap"
-    dev_exists "$dev" || die "device $dev not present"
     if [[ "$applied" =~ ^[0-9]+$ ]]; then
         cur="$(cur_txqlen "$dev")"
         if [[ "$cur" != "$applied" ]]; then

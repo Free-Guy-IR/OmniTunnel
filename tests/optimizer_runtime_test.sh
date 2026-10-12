@@ -190,5 +190,33 @@ swapout="$(cat "$tmp/swap.out" 2>/dev/null)"
 [[ "$(qval ts-other)" == 1000 ]] && pass "apply did not mutate the swapped-in device either" || fail "apply mutated ts-other to '$(qval ts-other)'"
 [[ ! -f "$OMNITUN_OPT_STATE/ts-swap.txqlen" ]] && pass "apply left no snapshot after the under-lock abort" || fail "apply left a stray snapshot after the under-lock abort"
 
+mkdir -p "$OMNITUN_INST_DIR/rbswap"
+printf 'TYPE=icmp\nDEV=ts-rba\n' > "$OMNITUN_INST_DIR/rbswap/instance.conf"
+echo 1000 > "$OMNITUN_FAKE_DIR/ts-rba.qlen"
+echo 1000 > "$OMNITUN_FAKE_DIR/ts-rbb.qlen"
+rm -f "$OMNITUN_OPT_STATE/ts-rba.txqlen" "$OMNITUN_OPT_STATE/ts-rbb.txqlen"
+bash "$OPT" apply rbswap --acknowledge >/dev/null 2>&1
+[[ "$(qval ts-rba)" == 2000 && "$(sed -n 1p "$OMNITUN_OPT_STATE/ts-rba.txqlen")" == 1000 && "$(sed -n 2p "$OMNITUN_OPT_STATE/ts-rba.txqlen")" == 2000 ]] && pass "rollback-dev-change setup: apply on ts-rba wrote a before/applied snapshot" || fail "rollback-dev-change setup (dev=$(qval ts-rba))"
+(
+    exec 9>"$OMNITUN_OPT_STATE/ts-rba.lock"
+    flock -x 9
+    sleep 1.2
+) &
+holder=$!
+sleep 0.3
+bash "$OPT" rollback rbswap >"$tmp/rbswap.out" 2>&1 &
+rbpid=$!
+sleep 0.3
+printf 'TYPE=icmp\nDEV=ts-rbb\n' > "$OMNITUN_INST_DIR/rbswap/instance.conf"
+wait "$holder"
+wait "$rbpid"; rc=$?
+rbout="$(cat "$tmp/rbswap.out" 2>/dev/null)"
+[[ "$rc" -ne 0 ]] && pass "rollback aborts when the DEV mapping changes under the lock" || fail "rollback aborts on under-lock DEV change (rc=$rc)"
+[[ "$rbout" == *"changed under lock"* ]] && pass "rollback names the under-lock DEV change" || fail "rollback under-lock message (got: $rbout)"
+[[ "$(qval ts-rba)" == 2000 ]] && pass "rollback did not clobber the pre-lock device after the mapping change (ts-rba stayed 2000)" || fail "rollback clobbered ts-rba to '$(qval ts-rba)'"
+[[ "$(qval ts-rbb)" == 1000 ]] && pass "rollback did not touch the swapped-in device (ts-rbb stayed 1000)" || fail "rollback mutated ts-rbb to '$(qval ts-rbb)'"
+[[ -f "$OMNITUN_OPT_STATE/ts-rba.txqlen" && "$(sed -n 1p "$OMNITUN_OPT_STATE/ts-rba.txqlen")" == 1000 && "$(sed -n 2p "$OMNITUN_OPT_STATE/ts-rba.txqlen")" == 2000 ]] && pass "rollback preserved the snapshot after the under-lock abort" || fail "rollback lost or altered the snapshot after the under-lock abort"
+rm -f "$OMNITUN_OPT_STATE/ts-rba.txqlen" "$OMNITUN_OPT_STATE/ts-rbb.txqlen"
+
 if [[ "$fails" -ne 0 ]]; then echo "optimizer_runtime_test: $fails failure(s)"; exit 1; fi
 echo "optimizer_runtime_test PASS"
