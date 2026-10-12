@@ -136,42 +136,62 @@ cmd_dry_run() {
 }
 
 cmd_apply() {
-    local inst="$1" ack="$2" dev before after snap
+    local inst="$1" ack="$2" dev before after snap created_snap reread
     [[ -n "$inst" ]] || die "apply needs an instance"
     dev="$(dev_of "$inst")"
     [[ -n "$dev" ]] || die "instance $inst has no DEV"
     dev_allowed "$dev" || die "refusing to mutate '$dev': not an OmniTunnel TUN device (allowlist ts-* / ts<8 digits>)"
     dev_exists "$dev" || die "device $dev not present"
     [[ "$ack" == 1 ]] || die "apply mutates txqueuelen on $dev; re-run with --acknowledge to proceed"
+    mkdir -p "$STATE_DIR"
+    exec 9>"$STATE_DIR/$dev.lock"
+    flock -x 9
     before="$(cur_txqlen "$dev")"
     [[ -n "$before" ]] || die "cannot read current txqueuelen for $dev"
-    mkdir -p "$STATE_DIR"
     snap="$STATE_DIR/$dev.txqlen"
-    echo "$before" > "$snap"
-    echo "snapshot: $dev txqueuelen=$before -> $snap"
-    set_txqlen "$dev" "$RECOMMENDED_TXQLEN" || { rm -f "$snap"; die "failed to set txqueuelen on $dev"; }
+    created_snap=0
+    if [[ -e "$snap" ]]; then
+        echo "snapshot: $dev already recorded as $(cat "$snap"); preserving $snap"
+    else
+        echo "$before" > "$snap"
+        created_snap=1
+        echo "snapshot: $dev txqueuelen=$before -> $snap"
+    fi
+    if ! set_txqlen "$dev" "$RECOMMENDED_TXQLEN"; then
+        [[ "$created_snap" == 1 ]] && rm -f "$snap"
+        die "failed to set txqueuelen on $dev"
+    fi
     after="$(cur_txqlen "$dev")"
     if [[ "$after" != "$RECOMMENDED_TXQLEN" ]]; then
         echo "validation failed on $dev (got '${after:-}', wanted $RECOMMENDED_TXQLEN); reverting" >&2
         set_txqlen "$dev" "$before" 2>/dev/null || true
-        rm -f "$snap"
-        die "apply did not take; reverted $dev to $before"
+        reread="$(cur_txqlen "$dev")"
+        if [[ "$reread" == "$before" && "$created_snap" == 1 ]]; then
+            rm -f "$snap"
+            die "apply did not take; reverted $dev to $before"
+        fi
+        die "apply did not take on $dev; revert incomplete (current=${reread:-unknown}, original=$before); snapshot kept at $snap for manual recovery"
     fi
     echo "applied: $dev txqueuelen $before -> $after  (rollback: optimizer.sh rollback $inst)"
 }
 
 cmd_rollback() {
-    local inst="$1" dev snap before
+    local inst="$1" dev snap before reread
     [[ -n "$inst" ]] || die "rollback needs an instance"
     dev="$(dev_of "$inst")"
     [[ -n "$dev" ]] || die "instance $inst has no DEV"
     dev_allowed "$dev" || die "refusing: $dev is not an OmniTunnel TUN device"
+    mkdir -p "$STATE_DIR"
+    exec 9>"$STATE_DIR/$dev.lock"
+    flock -x 9
     snap="$STATE_DIR/$dev.txqlen"
     [[ -f "$snap" ]] || die "no snapshot for $dev ($snap); nothing to roll back"
     before="$(cat "$snap")"
     [[ "$before" =~ ^[0-9]+$ ]] || die "corrupt snapshot $snap"
     dev_exists "$dev" || die "device $dev not present"
     set_txqlen "$dev" "$before" || die "rollback failed on $dev"
+    reread="$(cur_txqlen "$dev")"
+    [[ "$reread" == "$before" ]] || die "rollback did not take on $dev (current=${reread:-unknown}, wanted $before); snapshot kept at $snap for manual recovery"
     rm -f "$snap"
     echo "rolled back: $dev txqueuelen -> $before"
 }

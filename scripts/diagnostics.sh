@@ -8,10 +8,7 @@ dev=""
 if [[ -n "$inst" ]]; then
     conf="$INST_DIR/$inst/instance.conf"
     [[ -f "$conf" ]] || { echo "no such instance: $inst" >&2; exit 1; }
-    DEV=""; TYPE=""
-    # shellcheck disable=SC1090
-    source "$conf"
-    dev="$DEV"
+    dev="$(grep -m1 -oE '^DEV=.*' "$conf" | cut -d= -f2- | tr -d '"'\''')"
 fi
 
 sec() { printf '\n===== %s =====\n' "$1"; }
