@@ -9,6 +9,8 @@
 #include <stddef.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <errno.h>
+#include <sys/random.h>
 #include "monocypher.h"
 
 #define NONCE_LEN 24
@@ -17,13 +19,26 @@
 
 static inline void ts_random(void *buf, size_t n) {
     unsigned char *b = (unsigned char *)buf;
-    int fd = open("/dev/urandom", O_RDONLY);
     size_t g = 0;
-    if (fd >= 0) {
-        while (g < n) { ssize_t r = read(fd, b + g, n - g); if (r <= 0) break; g += (size_t)r; }
-        close(fd);
+    while (g < n) {
+        ssize_t r = getrandom(b + g, n - g, 0);
+        if (r > 0) { g += (size_t)r; continue; }
+        if (r < 0 && errno == EINTR) continue;
+        break;
     }
-    for (; g < n; g++) b[g] = (unsigned char)(g * 1103515245u + 12345u);
+    if (g < n) {
+        int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+        if (fd >= 0) {
+            while (g < n) {
+                ssize_t r = read(fd, b + g, n - g);
+                if (r > 0) { g += (size_t)r; continue; }
+                if (r < 0 && errno == EINTR) continue;
+                break;
+            }
+            close(fd);
+        }
+    }
+    if (g < n) _exit(70);
 }
 
 /* Drop-in replacements with the SAME signatures as libsodium's

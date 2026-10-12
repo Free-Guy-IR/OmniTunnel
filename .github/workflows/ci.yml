@@ -94,3 +94,57 @@ jobs:
             bash "$t"
             echo "::endgroup::"
           done
+
+  direct-c:
+    name: C core (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    steps:
+      - uses: actions/checkout@v4
+      - name: bash -n all shell
+        run: |
+          set -e
+          for s in install.sh omnitunnel.sh icmptun-ctl.sh scripts/*.sh tests/*.sh; do
+            [ -e "$s" ] || continue
+            echo "bash -n $s"
+            bash -n "$s"
+          done
+      - name: hardened full-core build
+        run: |
+          set -e
+          gcc -O2 -Wall -Wextra -fstack-protector-strong -D_FORTIFY_SOURCE=2 \
+            -o /tmp/omnitun \
+            src/main.c src/obsctun.c src/obsctcp.c src/obscmux.c src/obscws.c src/icmptun.c src/monocypher.c
+          /tmp/omnitun version
+      - name: clang syntax check
+        run: |
+          set -e
+          for c in src/main.c src/obsctun.c src/obsctcp.c src/obscmux.c src/obscws.c src/icmptun.c src/monocypher.c; do
+            echo "clang -fsyntax-only $c"
+            clang -fsyntax-only -Wall "$c"
+          done
+      - name: entropy unit test (ASan/UBSan)
+        run: |
+          set -e
+          gcc -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -Wall -Wextra \
+            -o /tmp/secure_nonce_test tests/secure_nonce_test.c
+          /tmp/secure_nonce_test
+          gcc -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -Wall -Wextra -DMOCK_FAIL \
+            -o /tmp/secure_nonce_fail_test tests/secure_nonce_test.c
+          /tmp/secure_nonce_fail_test
+      - name: python compile + unit tests
+        run: |
+          set -e
+          for p in scripts/*.py tests/*.py benchmarks/*.py; do
+            [ -e "$p" ] || continue
+            echo "py_compile $p"
+            python3 -m py_compile "$p"
+          done
+          python3 -m unittest benchmarks/test_latency_report.py
+      - name: shell escape regression guard
+        run: python3 tests/shell_escape_regression.py
+      - name: optimizer runtime test
+        run: bash tests/optimizer_runtime_test.sh
