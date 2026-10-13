@@ -17,7 +17,7 @@ extract() {
     }' "$SCRIPT"
 }
 
-eval "$(extract "tok_re lanes_ok inst_name_ok create_id_ok new_create_id inst_create_lock inst_create_unlock type_is_hysteria type_is_stripe type_is_ackless type_is_kernel type_is_revmux type_uses_key inst_path inst_conf inst_pf inst_exists list_instances create_inst cmd_peercreate cmd_remove_own provision_peer peer_inst_state peer_remove_own bench_run bench_create_id bench_peer_create bench_peer_remove bench_far_busy gen_key port_base type_port_span occupied_port_ranges alloc_port_span next_port next_subnet_idx mux_conf pick_num")"
+eval "$(extract "tok_re lanes_ok inst_name_ok create_id_ok new_create_id inst_create_lock inst_create_unlock type_is_hysteria type_is_stripe type_is_ackless type_is_kernel type_is_revmux type_uses_key inst_path inst_conf inst_pf inst_exists list_instances create_inst cmd_peercreate cmd_remove_own provision_peer peer_inst_state peer_remove_own bench_run bench_create_id bench_reg_file bench_reg_lock bench_id_lock bench_reg_add bench_reg_del bench_abandoned_ids bench_clean_abandoned bench_run_done bench_peer_create bench_peer_remove bench_far_busy gen_key port_base type_port_span occupied_port_ranges alloc_port_span next_port next_subnet_idx mux_conf pick_num")"
 eval "$(grep -m1 '^ALL_TYPES=' "$SCRIPT")"
 
 DISPATCH="$(grep -E '^[[:space:]]+(_peercreate|_remove_own|_remove)\)' "$SCRIPT")"
@@ -314,12 +314,9 @@ case_h() {
 }
 
 case_i() {
-    local NEAR="$WORK/i_near" OUT="$WORK/i.out" tcp_before mux_before t id
+    local NEAR="$WORK/i_near" OUT="$WORK/i.out" tcp_before mux_before t bid_used u1 u2
     relay_env i_foreign "" bench
     ROOT_DIR="$WORK/i_root"; mkdir -p "$ROOT_DIR" "$NEAR"
-    printf '%s\n' "$ID3" > "$ROOT_DIR/bench.id"
-    omni_in "$FOREIGN" _peercreate bench-udp udp server 203.0.113.9 1.2.3.4 28900 "$K" 10.201.9.2 10.201.9.1 none 8 >/dev/null 2>&1 || fail "seed bench-udp"
-    printf 'CREATE_ID=%s\n' "$ID3" >> "$FOREIGN/bench-udp/instance.conf"
     omni_in "$FOREIGN" _peercreate bench-tcp tcp server 203.0.113.7 198.51.100.7 51900 "$K" 10.201.8.2 10.201.8.1 none 8 >/dev/null 2>&1 || fail "seed bench-tcp"
     printf 'CREATE_ID=%s\n' "$OTHER" >> "$FOREIGN/bench-tcp/instance.conf"
     omni_in "$FOREIGN" _peercreate bench-mux mux server 203.0.113.7 198.51.100.7 51901 "$K" 10.201.7.2 10.201.7.1 none 8 >/dev/null 2>&1 || fail "seed bench-mux"
@@ -350,7 +347,9 @@ case_i() {
     set +e
     [[ "$(snap "$FOREIGN/bench-tcp")" == "$tcp_before" ]] || fail "bench overwrote or removed another relay's bench-tcp on the foreign (now: $(snap "$FOREIGN/bench-tcp" | head -1))"
     [[ "$(snap "$FOREIGN/bench-mux")" == "$mux_before" ]] || fail "bench overwrote or removed a bench-mux it did not create"
-    grep -qE "omnitunnel\.sh _peercreate 'bench-udp' .* '$ID3'\$" "$PCALLS" || fail "bench did not create bench-udp with this relay's bench id: $(grep _peercreate "$PCALLS" | head -3)"
+    bid_used="$(sed -nE "s/.* _peercreate 'bench-udp' .* '([0-9a-f]{32})'\$/\1/p" "$PCALLS" | head -1)"
+    [[ -n "$bid_used" ]] || fail "bench did not create bench-udp with a per-run creation id: $(grep _peercreate "$PCALLS" | head -3)"
+    [[ "$bid_used" != "$OTHER" ]] || fail "bench used another relay's creation id as its own run id"
     for t in $ALL_TYPES; do
         case "$t" in tcp|mux) continue;; esac
         [[ ! -e "$FOREIGN/bench-$t" ]] || fail "bench left its own bench-$t on the foreign"
@@ -358,15 +357,14 @@ case_i() {
     no_unconditional_remove || fail "bench still runs the unconditional _remove on the foreign"
     ! grep -q " mux-off " "$PCALLS" || fail "bench still runs the unconditional mux-off on the foreign"
     grep -q "bench-clean" "$OUT" || fail "bench did not tell the operator how to clear the instances in its way"
-    rm -f "$ROOT_DIR/bench.id"
-    id="$(bench_create_id)" || fail "bench_create_id failed without a stored id"
-    create_id_ok "$id" || fail "bench_create_id returned a malformed id '$id'"
-    [[ "$(cat "$ROOT_DIR/bench.id" 2>/dev/null)" == "$id" ]] || fail "bench_create_id did not store its id"
-    [[ "$(stat -c %a "$ROOT_DIR/bench.id")" == 600 ]] || fail "bench.id is not mode 600"
-    [[ "$(bench_create_id)" == "$id" ]] || fail "bench_create_id is not stable across runs"
-    printf 'junk\n' > "$ROOT_DIR/bench.id"
-    id="$(bench_create_id)"
-    create_id_ok "$id" || fail "bench_create_id kept a malformed stored id"
+    rm -f "$ROOT_DIR/bench.ids" "$ROOT_DIR"/bench.*.lock 2>/dev/null
+    u1="$(bench_create_id)" || fail "bench_create_id failed"
+    create_id_ok "$u1" || fail "bench_create_id returned a malformed id '$u1'"
+    grep -qxF "$u1" "$ROOT_DIR/bench.ids" || fail "bench_create_id did not record its run id in the registry"
+    [[ "$(stat -c %a "$ROOT_DIR/bench.ids")" == 600 ]] || fail "the bench id registry is not mode 600"
+    u2="$(bench_create_id)" || fail "bench_create_id failed on a second run"
+    create_id_ok "$u2" || fail "bench_create_id returned a malformed id '$u2'"
+    [[ "$u1" != "$u2" ]] || fail "bench_create_id must return a distinct id per run, got the same twice"
 }
 
 RESULTS=(); BAD=0

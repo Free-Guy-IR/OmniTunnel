@@ -1634,13 +1634,20 @@ provision_peer() {
     fi
     peer_ssh "$h" "OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh _peercreate '$name' '$t' server '$plip' '$prip' '$port' '$key' '$pta' '$ppa' '$shape' '$nc' '$imode' '' '$lanes' '$cid'" \
         || die "the foreign $h did not create '$name' (see its message above); nothing was set up on this box"
-    type_is_stripe "$t" || return 0
-    local plane
-    plane=$(peer_ssh "$h" "grep -m1 -E '^LANES=' /etc/omnitunnel/inst/'$name'/instance.conf" 2>/dev/null | tr -d '\r' || true)
-    [[ "$plane" == "LANES=$lanes" ]] && return 0
-    [[ -z "$plane" && "$lanes" == 1 ]] && return 0
-    peer_remove_own "$h" "$name" "$cid"
-    die "the foreign $h did not record lane count $lanes for '$name' (it has '${plane:-no LANES line}'), so its manager is not v$VERSION; $PEER_CLEANUP_MSG - update the foreign and retry"
+    if type_is_stripe "$t"; then
+        local plane
+        plane=$(peer_ssh "$h" "grep -m1 -E '^LANES=' /etc/omnitunnel/inst/'$name'/instance.conf" 2>/dev/null | tr -d '\r' || true)
+        if [[ "$plane" != "LANES=$lanes" ]] && ! [[ -z "$plane" && "$lanes" == 1 ]]; then
+            peer_remove_own "$h" "$name" "$cid"
+            die "the foreign $h did not record lane count $lanes for '$name' (it has '${plane:-no LANES line}'), so its manager is not v$VERSION; $PEER_CLEANUP_MSG - update the foreign and retry"
+        fi
+    fi
+    local pstate; pstate="$(peer_inst_state "$h" "$name" "$cid")"
+    if [[ "$pstate" == other || "$pstate" == absent ]]; then
+        peer_remove_own "$h" "$name" "$cid"
+        die "the foreign $h no longer holds this run's creation id for '$name' (state: $pstate); a concurrent run replaced or removed its foreign side, so nothing was set up on this box; $PEER_CLEANUP_MSG"
+    fi
+    return 0
 }
 peer_inst_state() {
     local out rc=0 id
@@ -2041,13 +2048,63 @@ bench_curl_mbps() {
     [[ -n "$bps" ]] || return 1
     awk -v b="$bps" 'BEGIN{ m=b*8/1000000; if(m<0.05) exit 1; printf "%.3g Mbits/sec", m }'
 }
+bench_reg_file() { echo "$ROOT_DIR/bench.ids"; }
+bench_reg_lock() { echo "$ROOT_DIR/.bench.ids.lock"; }
+bench_id_lock() { echo "$ROOT_DIR/bench.$1.lock"; }
+bench_reg_add() {
+    local id="$1"
+    mkdir -p "$ROOT_DIR" 2>/dev/null || true
+    ( umask 077; printf '%s\n' "$id" >> "$(bench_reg_file)" && chmod 600 "$(bench_reg_file)" ) 2>/dev/null || true
+}
+bench_reg_del() {
+    local id="$1" reg tmp
+    reg="$(bench_reg_file)"
+    (
+        if exec {rfd}>"$(bench_reg_lock)" 2>/dev/null; then flock "$rfd" 2>/dev/null || true; fi
+        [[ -r "$reg" ]] || exit 0
+        tmp="$(mktemp "$ROOT_DIR/.bench.ids.XXXXXX" 2>/dev/null)" || exit 0
+        grep -vxF "$id" "$reg" 2>/dev/null > "$tmp" || true
+        chmod 600 "$tmp" 2>/dev/null || true
+        mv -f "$tmp" "$reg" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+    ) 2>/dev/null || true
+    rm -f "$(bench_id_lock "$id")" 2>/dev/null || true
+}
 bench_create_id() {
-    local f="$ROOT_DIR/bench.id" id=""
-    [[ -r "$f" ]] && id="$(tr -d ' \r\n' < "$f" 2>/dev/null)" || id=""
-    create_id_ok "$id" && { printf '%s' "$id"; return 0; }
+    local id
     id="$(new_create_id)" || return 1
-    ( umask 077; printf '%s\n' "$id" > "$f" && chmod 600 "$f" ) 2>/dev/null || true
+    mkdir -p "$ROOT_DIR" 2>/dev/null || true
+    BENCH_ID="$id"
+    if exec {BENCH_LOCK_FD}>"$(bench_id_lock "$id")" 2>/dev/null; then flock "$BENCH_LOCK_FD" 2>/dev/null || true; fi
+    bench_reg_add "$id"
     printf '%s' "$id"
+}
+bench_abandoned_ids() {
+    local reg id fd; reg="$(bench_reg_file)"; [[ -r "$reg" ]] || return 0
+    while IFS= read -r id; do
+        create_id_ok "$id" || continue
+        [[ "$id" == "${BENCH_ID:-}" ]] && continue
+        if ( exec {fd}>"$(bench_id_lock "$id")" 2>/dev/null && flock -n "$fd" 2>/dev/null ); then
+            printf '%s\n' "$id"
+        fi
+    done < "$reg"
+}
+bench_clean_abandoned() {
+    local h="$1" aid t ids
+    ids="$(bench_abandoned_ids)" || true
+    [[ -n "$ids" ]] || return 0
+    for aid in $ids; do
+        for t in $ALL_TYPES; do bench_peer_remove "$h" "$aid" "bench-$t"; done
+        bench_reg_del "$aid"
+    done
+}
+bench_run_done() {
+    if [[ -n "${BENCH_LOCK_FD:-}" ]]; then
+        flock -u "$BENCH_LOCK_FD" 2>/dev/null || true
+        exec {BENCH_LOCK_FD}>&- 2>/dev/null || true
+        BENCH_LOCK_FD=""
+    fi
+    [[ -n "${BENCH_ID:-}" ]] && { bench_reg_del "$BENCH_ID"; BENCH_ID=""; }
+    return 0
 }
 bench_peer_remove() {
     peer_ssh "$1" "OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh _remove_own '$3' '$2'" >/dev/null 2>&1 || true
@@ -2149,7 +2206,9 @@ bench_run() {
     hy_target=$(awk -v s="$raw_dl" 'BEGIN{ n=s+0; if (s ~ /Kbits/) n/=1000; else if (s ~ /Gbits/) n*=1000; t=int(n*0.9); if (t<200) t=200; if (t>2000) t=2000; print t }')
     printf "  %bhysteria Brutal-CC target auto-scaled to %s mbps%b\n" "$C_GREY" "$hy_target" "$C_RESET"
 
-    local bid; bid="$(bench_create_id)" || { warn "cannot create the benchmark id in $ROOT_DIR"; return 1; }
+    bench_create_id >/dev/null || { warn "cannot create the benchmark id in $ROOT_DIR"; return 1; }
+    local bid="$BENCH_ID"
+    bench_clean_abandoned "$fhost" || true
     echo; printf "%b\n" "${C_BOLD}Benchmarking each tunnel (a few minutes)...${C_RESET}"
     local rows=() base; base=$(next_subnet_idx); local i=0 t
     # Best-effort measurement: one tunnel failing (a ping with no reply, an iperf
@@ -2246,6 +2305,7 @@ bench_run() {
     # tear down the foreign measurement helpers (iperf + curl file server)
     peer_ssh "$fhost" "systemctl stop tsbench-iperf tsbench-http 2>/dev/null; pkill -f '[h]ttp.server 5598' 2>/dev/null; rm -f /tmp/omnibench.bin" >/dev/null 2>&1 || true
     set -e
+    bench_run_done
 
     ROWS=("${rows[@]}"); RAW_DL="${raw_dl:-n/a}"; RAW_UL="${raw_ul:-n/a}"; RAW_PING="${raw_ping:-n/a}"; bench_table
     printf '  %bevery test tunnel was removed from both sides.%b\n\n' "$C_GREY" "$C_RESET"
