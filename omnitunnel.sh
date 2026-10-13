@@ -30,6 +30,7 @@ PEER_DIR="$ROOT_DIR/peers"
 SSH_KH_DIR="$ROOT_DIR/ssh"
 SSH_KNOWN_HOSTS="$SSH_KH_DIR/known_hosts"
 VARLIB_DIR="/var/lib/omnitunnel"
+RUN_DIR="/run/omnitunnel"
 TSUITE_BIN="${OMNITUN_BIN:-/usr/local/bin/omnitun}"
 BINLINK="/usr/local/bin/omnitunnel"   # the 'omnitunnel' command (symlink to this script)
 # Hysteria2 is a separate Go engine (QUIC/UDP with the loss-agnostic "Brutal"
@@ -704,10 +705,99 @@ apply_tuning() {
     else
         tc qdisc replace dev "$dev" root fq 2>/dev/null || true
     fi
+    with_mangle_lock mss_clamp_add "$dev" || mss_clamp_rules "$dev"
+}
+with_mangle_lock() {
+    local fd rc=0
+    mkdir -p "$RUN_DIR" 2>/dev/null || return 1
+    exec {fd}>>"$RUN_DIR/mangle.lock" || return 1
+    if flock -w 15 "$fd"; then "$@" || rc=$?; else rc=1; fi
+    exec {fd}>&-
+    return "$rc"
+}
+nft_mangle_state() {
+    command -v nft >/dev/null 2>&1 || return 0
+    local out line h="" use=bare ch="" chh="" cuse="" chains=""
+    out="$(nft -a list table ip mangle 2>/dev/null)" || return 0
+    while IFS= read -r line; do
+        line="${line#"${line%%[![:space:]]*}"}"
+        if [[ -z "$h" ]]; then
+            tok_re "$line" '^table ip mangle \{ # handle [0-9]+$' || return 0
+            h="${line##* }"
+            continue
+        fi
+        [[ -z "$line" ]] && continue
+        if [[ -z "$ch" ]] && tok_re "$line" '^chain (PREROUTING|INPUT|FORWARD|OUTPUT|POSTROUTING) \{ # handle ([0-9]+)$'; then
+            ch="${BASH_REMATCH[1]}"; chh="${BASH_REMATCH[2]}"; cuse=empty
+            continue
+        fi
+        if [[ "$line" == '}' ]]; then
+            [[ -n "$ch" ]] && chains+="chain $ch $chh $cuse"$'\n'
+            ch=""
+            continue
+        fi
+        if [[ -n "$ch" ]] && tok_re "$line" '^type (filter|route) hook (prerouting|input|forward|output|postrouting) priority (mangle|-150); policy accept;$'; then
+            continue
+        fi
+        use=used
+        [[ -n "$ch" ]] && cuse=used
+    done <<< "$out"
+    [[ -n "$h" ]] || return 0
+    printf 'table %s %s\n%s' "$h" "$use" "$chains"
+}
+mss_clamp_rules() {
+    local dev="$1"
     iptables -t mangle -C FORWARD -p tcp --tcp-flags SYN,RST SYN -o "$dev" -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || \
         iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -o "$dev" -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
     iptables -t mangle -C FORWARD -p tcp --tcp-flags SYN,RST SYN -i "$dev" -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || \
         iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -i "$dev" -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+}
+mss_clamp_add() {
+    local dev="$1" f="$RUN_DIR/mangle.owned" before after k th tb n h u
+    before="$(nft_mangle_state)"
+    mss_clamp_rules "$dev"
+    after="$(nft_mangle_state)"
+    [[ -n "$after" ]] || return 0
+    read -r k th u <<< "$after" || true
+    if [[ -z "$before" ]]; then
+        printf 'table %s\n' "$th" > "$f" 2>/dev/null || true
+        return 0
+    fi
+    read -r k tb u <<< "$before" || true
+    [[ "$tb" == "$th" ]] || return 0
+    while read -r k n h u; do
+        [[ "$k" == chain ]] || continue
+        grep -q "^chain $n " <<< "$before" && continue
+        printf 'chain %s %s %s\n' "$th" "$n" "$h" >> "$f" 2>/dev/null || true
+    done <<< "$after"
+    return 0
+}
+mangle_release() {
+    local f="$RUN_DIR/mangle.owned" recs st k th tu a b c n h u keep=""
+    [[ -f "$f" ]] || return 0
+    recs="$(cat "$f" 2>/dev/null)" || true
+    st="$(nft_mangle_state)"
+    if [[ -z "$st" ]]; then rm -f "$f"; return 0; fi
+    read -r k th tu <<< "$st" || true
+    while read -r k a b c; do
+        [[ "$a" == "$th" ]] || continue
+        case "$k" in
+            table)
+                if [[ "$tu" == bare ]] && nft delete table ip handle "$th" >/dev/null 2>&1; then
+                    rm -f "$f"; return 0
+                fi
+                keep+="table $a"$'\n';;
+            chain)
+                tok_re "$b" '^(PREROUTING|INPUT|FORWARD|OUTPUT|POSTROUTING)$' || continue
+                n=""; h=""; u=""
+                read -r k n h u <<< "$(grep "^chain $b " <<< "$st")" || true
+                [[ -n "$h" && "$h" == "$c" ]] || continue
+                if [[ "$u" == empty ]] && nft delete chain ip mangle handle "$c" >/dev/null 2>&1; then continue; fi
+                keep+="chain $a $b $c"$'\n';;
+        esac
+    done <<< "$recs"
+    if [[ -n "$keep" ]]; then printf '%s' "$keep" > "$f"; else rm -f "$f"; fi
+    return 0
 }
 
 # --------------------------------------------------- systemd unit + enable ----
@@ -1122,6 +1212,28 @@ inst_cleanup_residue() {
     rm -f "$VARLIB_DIR/ackless_$sdev.floor" 2>/dev/null || true
     rm -f "$VARLIB_DIR/ackless_$sdev".sendbase.* 2>/dev/null || true
 }
+inst_sdev_shared() {
+    local self="$1" sdev="$2" o d
+    for o in $(list_instances); do
+        [[ "$o" == "$self" ]] && continue
+        d="$(sed -n 's/^DEV=//p' "$(inst_conf "$o")" 2>/dev/null | head -n1)" || true
+        [[ -n "$d" && "${d//[^A-Za-z0-9_]/_}" == "$sdev" ]] && return 0
+    done
+    return 1
+}
+inst_nft_cleanup() {
+    local n="$1" dev="$2" sdev t
+    command -v nft >/dev/null 2>&1 || return 0
+    if inst_name_ok "$n" && [[ -n "$dev" ]] && ! systemctl is-active --quiet "$(svc_name "$n")" 2>/dev/null; then
+        sdev="${dev//[^A-Za-z0-9_]/_}"
+        if tok_re "$sdev" '^[A-Za-z0-9_]{1,15}$' && ! inst_sdev_shared "$n" "$sdev"; then
+            for t in "ackless_$sdev" "omnistripe_$sdev"; do
+                nft delete table ip "$t" >/dev/null 2>&1 || true
+            done
+        fi
+    fi
+    with_mangle_lock mangle_release || true
+}
 inst_remove() {
     need_root; inst_exists "$1" || { warn "no such instance: $1"; return 0; }
     load_inst "$1"
@@ -1133,6 +1245,7 @@ inst_remove() {
     systemctl daemon-reload 2>/dev/null || true
     pf_flush_chain "$1"; ip link del "$DEV" 2>/dev/null || true
     inst_cleanup_residue "$DEV"
+    inst_nft_cleanup "$1" "$DEV"
     rm -rf "$(inst_path "$1")"; ok "removed instance '$1'"
 }
 
@@ -2324,7 +2437,7 @@ cmd_uninstall() {
     rm -f "$TSUITE_BIN" "$HYSTERIA_BIN" "$HY_RELAY" "$FWD_SYSCTL_FILE"
     rm -rf /etc/systemd/system/omnitun-*.service.d
     # 5) state, the command symlink, then the install dir (this script lives there)
-    rm -rf "$ROOT_DIR"
+    rm -rf "$ROOT_DIR" "$RUN_DIR"
     rm -f "$BINLINK"
     ok "OmniTunnel removed. Deleting its own files now - goodbye."
     rm -rf "$ASSET_DIR"
