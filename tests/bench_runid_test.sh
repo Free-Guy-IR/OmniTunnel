@@ -186,6 +186,27 @@ case_legacy() {
     ! reg_has "$LG" "$R/bench.ids" || fail "legacy: the migrated legacy id was not dropped after a confirmed removal"
 }
 
+case_regrace() {
+    local R reg i nid lost=0 dpid
+    local N="${REG_RACE_ADDS:-150}" DELS="${REG_RACE_DELS:-400}" PAD="${REG_RACE_PAD:-8000}"
+    local allf="ffffffffffffffffffffffffffffffff"
+    R="$WORK/rr.r"; mkdir -p "$R"; reg="$R/bench.ids"
+    seq 1 "$PAD" | awk -v h="$HX" '{printf "%032x %s\n", $1, h}' > "$reg"; chmod 600 "$reg"
+    ( ROOT_DIR="$R"; for ((i=0;i<DELS;i++)); do bench_reg_del "$allf"; done ) &
+    dpid=$!
+    for ((i=0;i<N;i++)); do
+        nid="$(printf 'ad%030x' "$i")"
+        ( ROOT_DIR="$R"; bench_reg_add "$nid" "$HX" )
+    done
+    wait "$dpid" 2>/dev/null
+    for ((i=0;i<N;i++)); do
+        nid="$(printf 'ad%030x' "$i")"
+        reg_has "$nid" "$reg" || lost=$((lost+1))
+    done
+    [[ "$lost" -eq 0 ]] || fail "regrace: $lost of $N ids added during a concurrent bench_reg_del were lost (registry lost-update)"
+    echo "regrace: $N adds overlapped $DELS dels, none lost"
+}
+
 RESULTS=(); BAD=0
 run_case() {
     local id="$1" out rc=0
@@ -194,7 +215,7 @@ run_case() {
     else RESULTS+=("FAIL ($id): $(grep -m1 '^FAIL' <<<"$out" || tail -n1 <<<"$out")"); BAD=1; fi
 }
 
-for c in interleave unit crash live empty crosshost failremove legacy; do run_case "$c"; done
+for c in interleave unit crash live empty crosshost failremove legacy regrace; do run_case "$c"; done
 printf '%s\n' "${RESULTS[@]}"
 [[ $BAD -eq 0 ]] || { echo "bench_runid_test FAILED" >&2; exit 1; }
 echo "PASSED - distinct per-run benchmark ids ($ITER concurrent pairs never cross-remove), host-tagged registry with flock liveness: an abandoned id is dropped only after a CONFIRMED same-host removal, kept when the host differs (crosshost) or the removal fails (failremove), a live concurrent run is untouched, and a legacy 2.9.12 bench.id is migrated and cleaned"

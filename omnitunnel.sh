@@ -2054,7 +2054,10 @@ bench_id_lock() { echo "$ROOT_DIR/bench.$1.lock"; }
 bench_reg_add() {
     local id="$1" host="${2:-}"
     mkdir -p "$ROOT_DIR" 2>/dev/null || true
-    ( umask 077; printf '%s %s\n' "$id" "$host" >> "$(bench_reg_file)" && chmod 600 "$(bench_reg_file)" ) 2>/dev/null || true
+    (
+        if exec {afd}>"$(bench_reg_lock)" 2>/dev/null; then flock "$afd" 2>/dev/null || true; fi
+        umask 077; printf '%s %s\n' "$id" "$host" >> "$(bench_reg_file)" && chmod 600 "$(bench_reg_file)"
+    ) 2>/dev/null || true
 }
 bench_reg_del() {
     local id="$1" reg tmp
