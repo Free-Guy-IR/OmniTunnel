@@ -250,3 +250,77 @@ func TestSenderInterleavedWritersReaders(t *testing.T) {
 		t.Fatalf("after acking everything, %d chunks still inflight (lost/stuck under concurrency)", b)
 	}
 }
+
+func TestClientRTOTracksTimeout(t *testing.T) {
+	cases := []struct {
+		in   time.Duration
+		want time.Duration
+	}{
+		{0, 10 * time.Second},
+		{-1, 10 * time.Second},
+		{100 * time.Millisecond, 500 * time.Millisecond},
+		{1500 * time.Millisecond, 3 * time.Second},
+		{2500 * time.Millisecond, 5 * time.Second},
+		{5 * time.Second, 10 * time.Second},
+	}
+	for _, c := range cases {
+		if got := clientRTO(c.in); got != c.want {
+			t.Fatalf("clientRTO(%v)=%v want %v", c.in, got, c.want)
+		}
+	}
+	if clientRTO(1500*time.Millisecond) <= 1500*time.Millisecond {
+		t.Fatalf("rto must exceed the io timeout so it never races an in-flight round trip")
+	}
+}
+
+func TestMultiLaneApplyRejectsReplayForged(t *testing.T) {
+	const nlanes = 8
+	const perLane = 128
+	rcv := ilTunnel(t, ilKey(), "turkey", nlanes, 2048)
+	builder := ilTunnel(t, ilKey(), "relay", nlanes, 2048)
+	atk := ilTunnel(t, ilWrongKey(), "relay", nlanes, 2048)
+
+	var good, forged [][]byte
+	for ln := 0; ln < nlanes; ln++ {
+		for i := 0; i < perLane; i++ {
+			good = append(good, builder.build(ln, 0, uint64(i+1), ilPacket()))
+			forged = append(forged, atk.build(ln, 0, uint64(i+1), ilPacket()))
+		}
+	}
+
+	var delivered, forgedAccepted int64
+	var wg sync.WaitGroup
+	for g := 0; g < 6; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range good {
+				if rcv.apply(good[i]) {
+					atomic.AddInt64(&delivered, 1)
+				}
+			}
+		}()
+	}
+	for g := 0; g < 2; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range forged {
+				if rcv.apply(forged[i]) {
+					atomic.AddInt64(&forgedAccepted, 1)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	if forgedAccepted != 0 {
+		t.Fatalf("%d forged frames accepted across %d lanes (HMAC auth broken)", forgedAccepted, nlanes)
+	}
+	if atomic.LoadInt64(&rcv.authFail) == 0 {
+		t.Fatalf("expected forged frames to register as auth failures")
+	}
+	if delivered != int64(nlanes*perLane) {
+		t.Fatalf("expected exactly %d unique deliveries across lanes, got %d (replay not exactly-once under concurrency)", nlanes*perLane, delivered)
+	}
+}

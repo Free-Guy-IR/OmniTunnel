@@ -18,7 +18,8 @@ extract() {
     }' "$SCRIPT"
 }
 
-eval "$(extract "ensure_binary ensure_omnistripe ensure_omniackless type_is_hysteria type_is_stripe type_is_ackless type_is_kernel cmd_server_token")"
+eval "$(extract "ensure_binary ensure_omnistripe ensure_omniackless type_is_hysteria type_is_stripe type_is_ackless type_is_kernel type_uses_key tok_re lanes_ok inst_name_ok type_known tok_host_ok tok_ipv4_ok tok_port_ok tok_nc_ok tok_hexkey_ok tok_key_ok tok_shape_ok tok_pmode_ok validate_inst_name list_instances cmd_server_token")"
+eval "$(grep -m1 '^ALL_TYPES=' "$SCRIPT")"
 
 fail() { echo "FAIL: $1" >&2; exit 1; }
 
@@ -37,6 +38,7 @@ die() { echo "DIE: $*"; exit 1; }
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
+INST_DIR="$WORK/inst"; mkdir -p "$INST_DIR"
 ASSET_DIR="$WORK/assets"; SCRIPT_DIR="$WORK/sd"; mkdir -p "$ASSET_DIR/bin" "$SCRIPT_DIR/bin"
 TSUITE_BIN="$WORK/nonexistent-omnitun"
 OMNISTRIPE_BIN="$WORK/omnistripe"; : > "$OMNISTRIPE_BIN"; chmod +x "$OMNISTRIPE_BIN"

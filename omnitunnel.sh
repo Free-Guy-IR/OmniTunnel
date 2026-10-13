@@ -20,7 +20,7 @@
 # /etc/icmptun install (this tool never reads, edits or deletes that).
 set -euo pipefail
 
-VERSION="2.9.11"
+VERSION="2.9.12"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 
@@ -87,7 +87,7 @@ norm_port() {
 validate_inst_name() {
     local n="${1:-}" other
     [[ -n "$n" ]] || die "instance name cannot be empty"
-    [[ "$n" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$ ]] || die "instance name must start alphanumeric and contain only letters, digits, - or _ (got '$n')"
+    inst_name_ok "$n" || die "instance name must start alphanumeric and contain only letters, digits, - or _ (got '$n')"
     for other in $(list_instances); do
         [[ "$other" == "$n" ]] && continue
         case "$n" in
@@ -245,6 +245,30 @@ port_base() { case "$1" in udp|fou|vxlan) echo 28820;; stripe) echo 40000;; ackl
 type_is_hysteria() { [[ "$1" == hysteria ]]; }
 type_is_stripe() { [[ "$1" == stripe ]]; }
 type_is_ackless() { [[ "$1" == ackless ]]; }
+tok_re() { local LC_ALL=C; [[ "$1" =~ $2 ]]; }
+lanes_ok() { tok_re "$1" '^([1-9]|[1-5][0-9]|6[0-4])$'; }
+inst_name_ok() { tok_re "$1" '^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$'; }
+type_known() { tok_re "$1" '^[a-z-]+$' && [[ " $ALL_TYPES " == *" $1 "* ]]; }
+tok_host_ok() { tok_re "$1" '^[A-Za-z0-9:][A-Za-z0-9.:-]{0,252}$'; }
+tok_ipv4_ok() { tok_re "$1" '^((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])$'; }
+tok_port_ok() { tok_re "$1" '^[1-9][0-9]{0,4}$' && (( $1 <= 65535 )); }
+tok_nc_ok() { tok_re "$1" '^[1-9][0-9]{0,4}$' && (( $1 <= 16384 )); }
+tok_hexkey_ok() { tok_re "$1" '^[0-9a-f]{64}$'; }
+tok_key_ok() { if [[ -z "$2" ]]; then ! type_uses_key "$1"; else tok_hexkey_ok "$2"; fi; }
+tok_shape_ok() { [[ -z "$1" || "$1" == none ]] || tok_re "$1" '^[0-9]{1,9}(\.[0-9]{1,3})?[A-Za-z]{0,5}$'; }
+tok_pmode_ok() { [[ -z "$1" || "$1" == reply || "$1" == request ]]; }
+mux_map_ok() {
+    local LC_ALL=C ph dp
+    [[ "$1" =~ ^([0-9]{1,5}):([A-Za-z0-9][A-Za-z0-9._-]{0,252}):([0-9]{1,5})$ ]] || return 1
+    ph="${BASH_REMATCH[1]}"; dp="${BASH_REMATCH[3]}"
+    norm_port "$ph" >/dev/null && norm_port "$dp" >/dev/null
+}
+new_inst_lanes() {
+    NEW_LANES=1
+    type_is_stripe "$1" || return 0
+    NEW_LANES="${STRIPE_LANES:-16}"
+    lanes_ok "$NEW_LANES" || die "STRIPE_LANES must be an integer 1..64 (got '$NEW_LANES')"
+}
 auto_name() { local base="$1" avoid=" ${2:-} " i=1 n; n="$base"; while inst_exists "$n" || [[ "$avoid" == *" $n "* ]]; do n="$base$i"; i=$((i+1)); done; echo "$n"; }
 
 # ------------------------------------------------------------ instance i/o ----
@@ -364,14 +388,14 @@ install_fwd_dropins() {
 
 load_inst() {
     local n="$1"; inst_exists "$n" || die "no such instance: $n"
-    TYPE=""; ROLE=""; LOCAL_IP=""; PEER_IP=""; TUN_ADDR=""; PEER_ADDR=""; PORT=""; KEY=""; DEV=""; MTU="1400"; NCONN="16"; SHAPE="none"; ICMP_MODE=""; PCOUNT="400"
+    TYPE=""; ROLE=""; LOCAL_IP=""; PEER_IP=""; TUN_ADDR=""; PEER_ADDR=""; PORT=""; KEY=""; DEV=""; MTU="1400"; NCONN="16"; SHAPE="none"; ICMP_MODE=""; PCOUNT="400"; LANES="1"
     # shellcheck disable=SC1090
     source "$(inst_conf "$n")"; INAME="$n"
 }
 
 # create NAME TYPE ROLE LOCAL PEER PORT KEY TUN_ADDR PEER_ADDR [SHAPE] [NCONN]
 create_inst() {
-    local n="$1" t="$2" role="$3" lip="$4" pip="$5" port="$6" key="$7" ta="$8" pa="$9" shape="${10:-none}" nc="${11:-16}" imode="${12:-}" pcount="${13:-400}"
+    local n="$1" t="$2" role="$3" lip="$4" pip="$5" port="$6" key="$7" ta="$8" pa="$9" shape="${10:-none}" nc="${11:-16}" imode="${12:-}" pcount="${13:-400}" lanes="${14:-1}"
     # reverse-mux IS icmp with the reply-type forced (its whole point is the
     # reply-gated dodge), so default its ICMP_MODE to reply if unset.
     [[ "$t" == reverse-mux && -z "$imode" ]] && imode=reply
@@ -393,6 +417,7 @@ NCONN=$nc
 SHAPE=$shape
 ICMP_MODE=$imode
 PCOUNT=$pcount
+LANES=$lanes
 EOF
 }
 
@@ -428,6 +453,9 @@ build_execstart() {
         echo "build_execstart: $TYPE requires a non-empty PSK but KEY is empty; refusing" >&2
         return 1
     fi
+    local sN=${NCONN:-16}
+    if [ "$sN" -lt 512 ]; then sN=512; fi
+    local sW=$(( sN * 2 ))
     case "$TYPE" in
         udp)  echo "$TSUITE_BIN udp -L $LOCAL_IP -R $PEER_IP -A $TUN_ADDR -P $PEER_ADDR -p $PORT -k $KEY -T $DEV -M $MTU";;
         tcp)  echo "$TSUITE_BIN tcp -L $LOCAL_IP -R $PEER_IP -A $TUN_ADDR -P $PEER_ADDR -p $PORT -k $KEY$sflag -T $DEV -M $MTU";;
@@ -437,7 +465,7 @@ build_execstart() {
         # reverse-mux rides the icmp engine with the reply type forced; the chisel
         # MUX layer lives in separate units (mux-add / mux-token), not here.
         reverse-mux) echo "$TSUITE_BIN icmp -L $LOCAL_IP -R $PEER_IP -A $TUN_ADDR -P $PEER_ADDR -I 4d54 -T $DEV -M $MTU$sflag -r ${ICMP_MODE:-reply}";;
-        stripe) echo "$OMNISTRIPE_BIN -L $LOCAL_IP -R $PEER_IP -A $TUN_ADDR -P $PEER_ADDR -k $KEY -p $PORT -C ${PCOUNT:-400} -N $NCONN -T $DEV -M $MTU$sflag";;
+        stripe) echo "$OMNISTRIPE_BIN -L $LOCAL_IP -R $PEER_IP -A $TUN_ADDR -P $PEER_ADDR -k $KEY -p $PORT -C ${PCOUNT:-400} -N $sN -lanes ${LANES:-1} -w $sW -to 1500 -F -T $DEV -M $MTU$sflag";;
         ackless) echo "$OMNIACKLESS_BIN -L $LOCAL_IP -R $PEER_IP -A $TUN_ADDR -P $PEER_ADDR -k $KEY -p $PORT -T $DEV -M $MTU$sflag";;
     esac
 }
@@ -1023,6 +1051,7 @@ cmd_mux_add() {
     pub="$(norm_port "$pub")" || die "public port must be 1-65535"
     dp="$(norm_port "$dp")" || die "destination port must be 1-65535"
     [[ -n "$dh" ]] || die "usage: mux-add <inst> <public_port> <dest_host> <dest_port>"
+    mux_map_ok "$pub:$dh:$dp" || die "destination host must be a hostname or IPv4 address (letters, digits, '.', '_' or '-')"
     load_inst "$inst"
     [[ "$ROLE" == server ]] && die "run mux-add on the RELAY (client) side of '$inst', not the foreign"
     local mc t rc; mc="$(mux_conf "$inst")"
@@ -1062,10 +1091,13 @@ cmd_mux_token() {
     local head; head=$(printf '%s\n' "$dec" | head -1)
     case "$head" in MUX1\|*) :;; *) die "invalid mux token";; esac
     local _tag inst relay_ip ctrl; IFS='|' read -r _tag inst relay_ip ctrl <<< "$head"
-    [[ -n "$inst" && -n "$relay_ip" && -n "$ctrl" ]] || die "invalid mux token"
+    inst_name_ok "$inst" || die "invalid token: instance name"
+    tok_ipv4_ok "$relay_ip" || die "invalid token: relay address"
+    tok_port_ok "$ctrl" || die "invalid token: control port"
     local maps=() ln
     while IFS= read -r ln; do case "$ln" in MUX1\|*|'') :;; *) maps+=("$ln");; esac; done <<< "$dec"
     [[ ${#maps[@]} -gt 0 ]] || die "mux token has no forwards"
+    for ln in "${maps[@]}"; do mux_map_ok "$ln" || die "invalid token: forward"; done
     mkdir -p "$INST_DIR/$inst"; printf '%s\n' "${maps[@]}" > "$(mux_conf "$inst")"
     mux_client_apply "$inst" "$relay_ip" "$ctrl" "${maps[@]}"
     ok "foreign mux client for '$inst' up: $relay_ip:$ctrl  (${#maps[@]} forward(s))"
@@ -1224,7 +1256,7 @@ alloc_port() {
     alloc_port_span "${1:-51820}" "$(type_port_span "${3:-}")" "${2:-}"
 }
 alloc_and_create() {
-    local n="$1" t="$2" role="$3" lip="$4" pip="$5" shape="$6" nc="$7" imode="$8" want_port="${9:-}" auto="${10:-}"
+    local n="$1" t="$2" role="$3" lip="$4" pip="$5" shape="$6" nc="$7" imode="$8" want_port="${9:-}" auto="${10:-}" lanes="${11:-1}"
     local afd
     mkdir -p "$INST_DIR" 2>/dev/null || true
     exec {afd}>"$INST_DIR/.alloc.lock" || die "cannot open allocation lock $INST_DIR/.alloc.lock"
@@ -1234,7 +1266,7 @@ alloc_and_create() {
     ALLOC_SUB=$(next_subnet_idx)
     ALLOC_PORT=$(next_port "${want_port:-$(( $(port_base "$t") + ALLOC_SUB ))}" "$t")
     ALLOC_KEY=$(gen_key); type_uses_key "$t" || ALLOC_KEY=""
-    create_inst "$n" "$t" "$role" "$lip" "$pip" "$ALLOC_PORT" "$ALLOC_KEY" "10.201.$ALLOC_SUB.1" "10.201.$ALLOC_SUB.2" "$shape" "$nc" "$imode"
+    create_inst "$n" "$t" "$role" "$lip" "$pip" "$ALLOC_PORT" "$ALLOC_KEY" "10.201.$ALLOC_SUB.1" "10.201.$ALLOC_SUB.2" "$shape" "$nc" "$imode" "" "$lanes"
     flock -u "$afd"
     exec {afd}>&-
 }
@@ -1322,7 +1354,8 @@ guard_peer_downgrade() {
 
 # push the manager + the peer's own-arch binary, then bring up the server side
 provision_peer() {
-    local h="$1" name="$2" t="$3" plip="$4" prip="$5" port="$6" key="$7" pta="$8" ppa="$9" shape="${10}" nc="${11}" imode="${12:-}"
+    local h="$1" name="$2" t="$3" plip="$4" prip="$5" port="$6" key="$7" pta="$8" ppa="$9" shape="${10}" nc="${11}" imode="${12:-}" lanes="${13:-1}"
+    lanes_ok "$lanes" || die "invalid lane count '$lanes' (want 1..64)"
     local parch; parch=$(peer_ssh "$h" "uname -m" 2>/dev/null | tr -d '\r')
     case "$parch" in x86_64|amd64) parch=amd64;; aarch64|arm64) parch=arm64;; *) die "peer $h has unsupported CPU: $parch";; esac
     info "  far side is $parch; deploying engine + manager to $h ..."
@@ -1351,15 +1384,24 @@ provision_peer() {
         peer_scp "$h" "$pbin" "/opt/omnitunnel/bin/omnitun-$parch"
         peer_ssh "$h" "chmod +x /opt/omnitunnel/bin/omnitun-$parch; install -m0755 /opt/omnitunnel/bin/omnitun-$parch /usr/local/bin/omnitun"
     fi
-    peer_ssh "$h" "OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh _peercreate '$name' '$t' server '$plip' '$prip' '$port' '$key' '$pta' '$ppa' '$shape' '$nc' '$imode'"
+    peer_ssh "$h" "OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh _peercreate '$name' '$t' server '$plip' '$prip' '$port' '$key' '$pta' '$ppa' '$shape' '$nc' '$imode' '' '$lanes'"
+    type_is_stripe "$t" || return 0
+    local plane
+    plane=$(peer_ssh "$h" "grep -m1 -E '^LANES=' /etc/omnitunnel/inst/'$name'/instance.conf" 2>/dev/null | tr -d '\r' || true)
+    [[ "$plane" == "LANES=$lanes" ]] && return 0
+    [[ -z "$plane" && "$lanes" == 1 ]] && return 0
+    peer_ssh "$h" "OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh _remove '$name'" >/dev/null 2>&1 || true
+    die "the foreign $h did not record lane count $lanes for '$name' (it has '${plane:-no LANES line}'), so its manager is not v$VERSION; the foreign side was removed - update the foreign and retry"
 }
 cmd_peercreate() {
     need_root
+    local lanes="${14:-1}"
+    lanes_ok "$lanes" || die "invalid lane count '$lanes' (want 1..64)"
     if type_is_hysteria "$2"; then ensure_hysteria
     elif type_is_stripe "$2"; then ensure_omnistripe
     elif type_is_ackless "$2"; then ensure_omniackless
     elif ! type_is_kernel "$2"; then ensure_binary; fi
-    create_inst "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" "${10}" "${11}" "${12:-}" "${13:-400}"
+    create_inst "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" "${10}" "${11}" "${12:-}" "${13:-400}" "$lanes"
     inst_enable "$1" >/dev/null 2>&1 || true; ok "peer instance '$1' up"
 }
 
@@ -1408,6 +1450,7 @@ cmd_add_auto() {
     local nc="${ADD_REST[0]:-16}" shape="${ADD_REST[1]:-none}" mylip="${ADD_REST[2]:-$(default_local_ip)}"
     [[ -n "$t" && -n "$kn" && -n "$fhost" ]] || die "usage: add-auto <type> [name] <foreign_ip> [nconn] [shape] [my_ip]"
     [[ -n "$auto_kn" ]] || { inst_exists "$kn" && die "instance $kn exists"; }
+    new_inst_lanes "$t"; local lanes="$NEW_LANES"
     [[ -n "${OMNITUN_PEER_PASS:-}" || -n "${OMNITUN_PEER_PROXY:-}" ]] && save_peer "$fhost" "${OMNITUN_PEER_USER:-root}" "${OMNITUN_PEER_PASS:-}" "${OMNITUN_PEER_PROXY:-}"
     guard_peer_downgrade "$fhost"
     # Ask the foreign what it already runs, so a second Iran box to the SAME foreign
@@ -1436,10 +1479,19 @@ cmd_add_auto() {
     fi
     sub=$(alloc_subnet "$fsub"); ta="10.201.$sub.1"; pa="10.201.$sub.2"
     port=$(alloc_port "$(( $(port_base "$t") + sub ))" "$(printf '%s\n' "$fport" | remote_port_ranges)" "$t"); key=$(gen_key); type_uses_key "$t" || key=""
-    provision_peer "$fhost" "$kn" "$t" "$fhost" "$mylip" "$port" "$key" "$pa" "$ta" "$shape" "$nc" "$pmode"
-    create_inst "$kn" "$t" client "$mylip" "$fhost" "$port" "$key" "$ta" "$pa" "$shape" "$nc" "$imode"
+    provision_peer "$fhost" "$kn" "$t" "$fhost" "$mylip" "$port" "$key" "$pa" "$ta" "$shape" "$nc" "$pmode" "$lanes"
+    create_inst "$kn" "$t" client "$mylip" "$fhost" "$port" "$key" "$ta" "$pa" "$shape" "$nc" "$imode" "" "$lanes"
     flock -u "$afd"; exec {afd}>&-
     inst_enable "$kn"; ok "instance '$kn' ($t) up: $mylip -> $fhost  (subnet 10.201.$sub.0/24, port/key $port)"
+}
+
+manual_token() {
+    local fields
+    printf -v fields '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s' "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" "${10}" "${11}"
+    if type_is_stripe "$2"; then
+        fields+="|${12:?a stripe token needs the lane count}"
+    fi
+    printf '%s' "$fields" | base64 | tr -d '\n'
 }
 
 # ---------------------------------------------------------- MANUAL mode --------
@@ -1468,12 +1520,13 @@ cmd_add_manual() {
     if type_is_revmux "$t" && [[ "$imode" == request || "$pmode" == request ]]; then
         warn "reverse-mux asked to emit echo-request; that gives up its reply-gated dodge"
     fi
+    new_inst_lanes "$t"; local lanes="$NEW_LANES"
     local sub port key ta pa
-    alloc_and_create "$kn" "$t" client "$mylip" "$fhost" "$shape" "$nc" "$imode" "$want_port" "$auto_kn"
+    alloc_and_create "$kn" "$t" client "$mylip" "$fhost" "$shape" "$nc" "$imode" "$want_port" "$auto_kn" "$lanes"
     kn="$ALLOC_NAME"; sub="$ALLOC_SUB"; port="$ALLOC_PORT"; key="$ALLOC_KEY"; ta="10.201.$sub.1"; pa="10.201.$sub.2"
     inst_enable "$kn"
     # Server-side params (tun IPs swapped). Encoded so it is a single paste.
-    local token; token=$(printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s' "$kn" "$t" "$fhost" "$mylip" "$port" "$key" "$pa" "$ta" "$shape" "$nc" "$pmode" | base64 | tr -d '\n')
+    local token; token=$(manual_token "$kn" "$t" "$fhost" "$mylip" "$port" "$key" "$pa" "$ta" "$shape" "$nc" "$pmode" "$lanes")
     echo
     echo "${C_GREEN}${C_BOLD}Near (Iran) side '$kn' is up.${C_RESET}"
     echo "${C_BOLD}Now run these TWO lines on the FOREIGN server ($fhost):${C_RESET}"
@@ -1488,9 +1541,22 @@ cmd_add_manual() {
 cmd_server_token() {
     need_root
     local dec; dec=$(printf '%s' "$1" | base64 -d 2>/dev/null) || die "invalid token"
-    local name t fhost mylip port key pta ppa shape nc pmode
-    IFS='|' read -r name t fhost mylip port key pta ppa shape nc pmode <<< "$dec"
-    [[ -n "$name" && -n "$t" ]] || die "invalid token"
+    local name t fhost mylip port key pta ppa shape nc pmode lanes
+    IFS='|' read -r name t fhost mylip port key pta ppa shape nc pmode lanes <<< "$dec"
+    inst_name_ok "$name" || die "invalid token: name"
+    type_known "$t" || die "invalid token: type"
+    tok_host_ok "$fhost" || die "invalid token: foreign address"
+    tok_host_ok "$mylip" || die "invalid token: near address"
+    tok_port_ok "$port" || die "invalid token: port"
+    tok_key_ok "$t" "$key" || die "invalid token: key"
+    tok_ipv4_ok "$pta" || die "invalid token: tunnel address"
+    tok_ipv4_ok "$ppa" || die "invalid token: peer tunnel address"
+    tok_shape_ok "$shape" || die "invalid token: shape"
+    tok_nc_ok "$nc" || die "invalid token: nconn"
+    tok_pmode_ok "$pmode" || die "invalid token: icmp mode"
+    lanes="${lanes:-1}"
+    lanes_ok "$lanes" || die "invalid token: lanes"
+    validate_inst_name "$name"
     if type_is_hysteria "$t"; then ensure_hysteria
     elif type_is_stripe "$t"; then ensure_omnistripe
     elif type_is_ackless "$t"; then ensure_omniackless
@@ -1501,7 +1567,7 @@ cmd_server_token() {
     # Replace it, then verify the unit actually came up and roll back if it did
     # not, so the token stays retryable.
     inst_exists "$name" && { warn "instance '$name' already exists - replacing it"; inst_remove "$name" >/dev/null 2>&1 || true; }
-    create_inst "$name" "$t" server "$fhost" "$mylip" "$port" "$key" "$pta" "$ppa" "$shape" "$nc" "$pmode"
+    create_inst "$name" "$t" server "$fhost" "$mylip" "$port" "$key" "$pta" "$ppa" "$shape" "$nc" "$pmode" "" "$lanes"
     inst_enable "$name"
     if ! inst_running "$name"; then
         inst_remove "$name" >/dev/null 2>&1 || true
@@ -1519,6 +1585,7 @@ wizard_add() {
     read -erp "Tunnel type [1]: " ch; ch="${ch:-1}"
     ch="$(pick_num "$ch" "${#types[@]}")" || { warn "pick a number between 1 and ${#types[@]}"; return; }
     t="${types[$((ch-1))]}"
+    new_inst_lanes "$t"; local lanes="$NEW_LANES"
     local mylip; mylip="$(default_local_ip)"
     read -erp "This box public IP [$mylip]: " x; mylip="${x:-$mylip}"
     read -erp "Far (foreign) server IP: " fhost; [[ -z "$fhost" ]] && { warn "need a foreign IP"; return; }
@@ -1545,8 +1612,8 @@ wizard_add() {
     case " $fnames " in *" $kn "*) warn "the foreign already has an instance named '$kn' - pick a different name"; return;; esac
     local sub port key ta pa; sub=$(alloc_subnet "$fsub"); ta="10.201.$sub.1"; pa="10.201.$sub.2"
     port=$(alloc_port "$(( $(port_base "$t") + sub ))" "$(printf '%s\n' "$fport" | remote_port_ranges)" "$t"); key=$(gen_key); type_uses_key "$t" || key=""
-    provision_peer "$fhost" "$kn" "$t" "$fhost" "$mylip" "$port" "$key" "$pa" "$ta" "$shape" "$nc"
-    create_inst "$kn" "$t" client "$mylip" "$fhost" "$port" "$key" "$ta" "$pa" "$shape" "$nc"
+    provision_peer "$fhost" "$kn" "$t" "$fhost" "$mylip" "$port" "$key" "$pa" "$ta" "$shape" "$nc" "" "$lanes"
+    create_inst "$kn" "$t" client "$mylip" "$fhost" "$port" "$key" "$ta" "$pa" "$shape" "$nc" "" "" "$lanes"
     inst_enable "$kn"; ok "instance '$kn' ($t) is up on both sides.  (subnet 10.201.$sub.0/24, port/key $port)"
     if type_is_revmux "$t"; then
         echo; info "reverse-mux carries user traffic over ONE muxed flow. Add its first forward now"
@@ -1846,8 +1913,9 @@ bench_run() {
     fnames=$(peer_ssh "$fhost" "ls /etc/omnitunnel/inst 2>/dev/null" 2>/dev/null | tr '\r\n' '  ' || true)
     case " $fnames " in *" $kn "*) warn "the foreign already has an instance named '$kn' - choose a different name"; return 1;; esac
     local sub port key ta pa; sub=$(alloc_subnet "$fsub"); ta="10.201.$sub.1"; pa="10.201.$sub.2"; port=$(alloc_port "$(( $(port_base "$keep") + sub ))" "$(printf '%s\n' "$fport" | remote_port_ranges)" "$keep"); key=$(gen_key); type_uses_key "$keep" || key=""
-    provision_peer "$fhost" "$kn" "$keep" "$fhost" "$mylip" "$port" "$key" "$pa" "$ta" "$shape" "$nc"
-    create_inst "$kn" "$keep" client "$mylip" "$fhost" "$port" "$key" "$ta" "$pa" "$shape" "$nc"
+    new_inst_lanes "$keep"; local lanes="$NEW_LANES"
+    provision_peer "$fhost" "$kn" "$keep" "$fhost" "$mylip" "$port" "$key" "$pa" "$ta" "$shape" "$nc" "" "$lanes"
+    create_inst "$kn" "$keep" client "$mylip" "$fhost" "$port" "$key" "$ta" "$pa" "$shape" "$nc" "" "" "$lanes"
     inst_enable "$kn"; ok "kept '$keep' as instance '$kn' on both sides."
 }
 
@@ -1933,10 +2001,16 @@ cmd_bench_manual() {
 }
 # Foreign side: bring up all four server tunnels + an iperf3 server, from a token.
 cmd_bench_server() {
-    need_root; ensure_binary
+    need_root
     local dec; dec=$(printf '%s' "$1" | base64 -d 2>/dev/null) || die "invalid token"
     local tag fhost mylip ku km kt; IFS='|' read -r tag fhost mylip ku km kt <<< "$dec"
     [[ "$tag" == bench ]] || die "not a benchmark token"
+    tok_host_ok "$fhost" || die "invalid token: foreign address"
+    tok_host_ok "$mylip" || die "invalid token: near address"
+    tok_hexkey_ok "$ku" || die "invalid token: udp key"
+    tok_hexkey_ok "$km" || die "invalid token: mux key"
+    tok_hexkey_ok "$kt" || die "invalid token: tcp key"
+    ensure_binary
     B_KUDP=$ku B_KMUX=$km B_KTCP=$kt
     command -v iperf3 >/dev/null || { apt-get install -y iperf3 >/dev/null 2>&1 || yum install -y iperf3 >/dev/null 2>&1 || true; }
     systemctl reset-failed omnitun-bench-iperf 2>/dev/null || true

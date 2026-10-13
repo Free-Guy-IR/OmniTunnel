@@ -1045,9 +1045,20 @@ func (t *Tunnel) roundTrip(cfg dialerCfg, lane int, seq uint64, buf []byte) (boo
 	return true, hadData
 }
 
+func clientRTO(ioTimeout time.Duration) time.Duration {
+	if ioTimeout <= 0 {
+		return 10 * time.Second
+	}
+	rto := 2 * ioTimeout
+	if rto < 500*time.Millisecond {
+		rto = 500 * time.Millisecond
+	}
+	return rto
+}
+
 func (t *Tunnel) runClient(cfg dialerCfg, upWorkers, dlWorkers int) {
 	for _, l := range t.lanes {
-		l.tx.rto = 10 * time.Second
+		l.tx.rto = clientRTO(cfg.timeout)
 	}
 	t.tunReader()
 	go t.retransmitLoop()
@@ -1188,7 +1199,7 @@ func clamp(v, lo, hi int) int {
 
 func main() {
 	if len(os.Args) == 2 && (os.Args[1] == "version" || os.Args[1] == "-V" || os.Args[1] == "--version") {
-		fmt.Println("omnistripe 1.0.3")
+		fmt.Println("omnistripe 1.0.4")
 		return
 	}
 	localIP := flag.String("L", "", "local source/bind IP")

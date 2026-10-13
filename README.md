@@ -140,7 +140,7 @@ route — an Iran server to a foreign box:
     reverse-mux  █████         233M     FAIL     0%     83
     hysteria     ████          198M     FAIL     0%     83
     tcp          █             69.6M    99.5M    0%     81
-    stripe       —             pending   pending   —        —     awaits real two-box bench
+    stripe       —             —         —         —        —     not in this run (real-path figures below)
     ackless      ████████████  622M     597M     0%     1     lab (netns, not real-path)
 ```
 
@@ -150,11 +150,9 @@ bench` itself. The `ackless` row (622/597 Mbit, 0% loss) is an **interim lab
 figure** measured on a single disposable host over a `netns`+`veth` loopback with
 `tc-netem` on a clean profile — it is a *relative* sanity measurement, **not a
 real Iran→foreign throughput** and not directly comparable to the real rows
-above; its real-path numbers from a two-box `omnitunnel bench` are still pending.
-The `stripe` row cannot be measured in a single-host `netns` (its engine, like
-the `udp`/`tcp`/`mux`/`ws` carriers, needs `omnitunnel`'s per-end setup on both
-boxes), so it awaits a real two-box bench — it is **not broken**, just not yet
-benched here.
+above. `stripe` was not part of that run. Real Iran→foreign numbers for both
+`ackless` and `stripe`, measured later on three differently policed paths, are in
+[the byte-cap section below](#the-third-shape-a-route-that-byte-caps-every-connection).
 
 The bar is scaled to the fastest tunnel; **→** marks the outright winner and
 **stealth pick** marks the fastest *fully obfuscated* transport. Read the two
@@ -213,27 +211,37 @@ punish.
 |---|---|
 | `stripe`, local network-namespace loopback proof, download-only | **126 Mbit** |
 | `stripe`, local netns, bidirectional | **stable** (no stall, no collapse) |
-| `stripe`, real Iran→foreign path, sustained bulk TCP | **stalls** — carrier comes up (ping 0% loss, both ends active) but single and parallel iperf3 do not sustain; real-path throughput pending |
+| `stripe` before tuning (v2.9.11 launch flags), real heavily policed Iran→foreign path | **1.22 Mbit** down, upload failing, ~330 ms tunnel RTT |
+| `stripe` tuned (v2.9.12), same path | **57–163 Mbit** down / **42–83 Mbit** up, **0 % loss**, ~120 ms tunnel RTT |
 
-These are a **local-netns functional proof only** — they show the transport
-sustains throughput without hitting a cap, not a real-link figure. Real-path
-numbers on a genuinely byte-capped route are still to be measured. `stripe` and
-`ackless` now appear as rows in the headline comparison above: the `ackless`
-figure there is the same class of interim `netns`+`netem` lab measurement (a
-relative sanity check, not a real Iran→foreign number), and the `stripe` row is
-left pending because its engine cannot be benched on a single host. Both get
-real numbers from a two-box `omnitunnel bench` before they are presented as
-real-path results.
+The netns rows are a local functional proof only. The last two rows are the real
+path, before and after the v2.9.12 tuning: 16 independent reliability lanes
+(each inner flow is hashed by its 5-tuple onto one lane, so a loss on one flow
+no longer head-of-line-blocks the flows on the other lanes), at least 512
+connection workers, an
+in-flight window of 2×N, a 1500 ms dial/I/O timeout so policed or dead
+connections are abandoned quickly instead of stalling the worker pool, TCP Fast
+Open, and a client retransmit backstop derived from that timeout instead of a
+fixed 10 s. The frame authentication (HMAC-SHA256) and the anti-replay window
+are unchanged.
 
-**Known limitation.** On a real Iran→foreign path the `stripe` carrier
-establishes cleanly but a sustained inner bulk-TCP transfer does not hold up,
-while `ackless` on the same path sustains tens of Mbit at 0% loss. This is
-inherent to stripe's rolling pool of short-lived connections and its bounded
-reassembly window under heavy cross-connection reordering, not an MTU/MSS-clamp
-interaction — the per-tun TCPMSS clamp is identical for every transport and the
-other tun transports do not stall. For high sustained throughput use `ackless`;
-`stripe` is the right choice specifically for a per-5-tuple byte-capped path
-where every long-lived carrier is blackholed.
+#### Same day, three paths
+
+The same transports measured on the same day from Iran to three differently
+policed foreign paths (download / upload, Mbit/s):
+
+| path | `ackless` | `stripe` | everything else |
+|---|---|---|---|
+| **A** — heavily policed | 107 / 61 | **57–163 / 42–83** (tuned) | every other transport failed |
+| **B** — heavily policed | **538 / 391** | 3.49 down (before tuning) | every other transport failed |
+| **C** — lightly policed | failed | 22 / 18 (before tuning) | `reverse-mux` **102 / 61**, `hysteria` 86 / 73, `gre` 76 / 77 |
+
+The `stripe` figures on paths B and C predate the tuning and have not been
+re-measured since. The lesson is the same one the headline benchmark teaches:
+**transport choice is path-dependent.** On A only the two short-flow carriers
+moved traffic at all, on B `ackless` led by a wide margin, and on the lightly
+policed C the classic carriers won while `ackless` never came up. Benchmark your
+own path and keep the winner.
 
 ---
 
@@ -258,8 +266,9 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Free-Guy-IR/OmniTunnel/main/
 omnitunnel server-token <token>
 ```
 
-The `<token>` carries the key, port and addresses — the tunnel comes straight
-up. No SSH between the two boxes is ever used.
+The `<token>` carries the key, port and addresses (and, for `stripe`, the lane
+count, so both ends agree) — the tunnel comes straight up. No SSH between the two
+boxes is ever used.
 
 **2. SOCKS5 proxy for provisioning.** If you already have a working SOCKS5 proxy
 on the Iran box, the auto setup can tunnel its SSH/SCP through it (as the
@@ -338,19 +347,58 @@ omnitunnel add-manual stripe main <foreign-ip> [N]
 ```
 
 The wizard asks only for the number of **striping connection workers N**
-(default 90); subnet, port and the port-count pool are allocated for you. It is
+(default 90; the manager always runs at least 512); subnet, port, the
+port-count pool and the lane count are allocated for you. It is
 provisioned with a generated pre-shared key that authenticates the stripe frames
 (the inner proxy traffic is separately encrypted) and, like every other
 transport, never touches the box's own SSH or port 22.
+
+**Lanes and upgrading.** Both ends of a `stripe` tunnel must run the same lane
+count: a receiver drops every frame that names a lane it does not have. So the
+lane count is fixed when a tunnel is created and is always given to both ends at
+once:
+
+- **New tunnels (v2.9.12+) run 16 lanes on both ends.** `add`, `add-auto` and
+  keeping `stripe` from the SSH benchmark push this same manager to the foreign
+  over SSH, create its side with the same lane count and then check that the
+  foreign recorded it; if it did not, the foreign side is removed and the add
+  stops before this side comes up. `add-manual` carries it
+  to the foreign inside the `server-token` (a 12th `|lanes` field that only
+  `stripe` tokens have; tokens for every other type are unchanged). The
+  benchmark's own throw-away `stripe` test tunnel runs 1 lane on both ends.
+- **Existing tunnels keep 1 lane on both ends**, whichever side is updated
+  first: their `instance.conf` records no lane count and both the manager and
+  `omnistripe` default to 1. They still gain the rest of the tuning (≥512
+  workers, window 2×N, 1500 ms timeout, TCP Fast Open) once their unit is
+  regenerated, e.g. with `omnitunnel enable <name>` on each end. To move one to
+  16 lanes, re-create it with both ends on v2.9.12 or newer.
+- **Override:** set `STRIPE_LANES` (an integer 1–64) on the creating (Iran) side,
+  e.g. `STRIPE_LANES=8 omnitunnel add-auto stripe main <foreign-ip>`; any other
+  value is refused. The foreign side follows automatically (over SSH, or via the
+  token in manual mode).
+- A foreign still on v2.9.11 or older cannot read a 12-field `stripe` token: it
+  stops with an error while loading the new instance (its shell reports
+  `16: command not found`) and no service is created, instead of bringing the
+  tunnel up. Run the install line the
+  manual flow prints before `server-token`, then re-run the same token.
+- **Tokens are strictly validated (v2.9.12+).** `server-token`, `mux-token` and
+  `bench-server` check every field against the exact format the manager itself
+  produces (instance name, known type, address charset, IPv4 tunnel addresses,
+  port and connection-count ranges, 64-hex keys, shaper rate, ICMP mode, lane
+  count, `port:host:port` forwards) and refuse the whole token before anything
+  is installed, written or started.
 
 Unlike the other transports `stripe` runs on its **own static engine**
 (`omnistripe`, a separate Go binary in [`bin/`](bin/)), so it is driven directly
 through that binary rather than through `omnitun`:
 
 ```bash
-omnistripe -L <local-ip> -R <peer-ip> -A <local-tun-ip> -P <peer-tun-ip> \
-           -p 40000 -C 400 -N 90 -T tsstripe0 -M 1400 [-s]
+omnistripe -L <local-ip> -R <peer-ip> -A <local-tun-ip> -P <peer-tun-ip> -k <key> \
+           -p 40000 -C 400 -N 512 -lanes 16 -w 1024 -to 1500 -F -T tsstripe0 -M 1400 [-s]
 ```
+
+That is the line the manager writes for a new tunnel with the default N; a
+tunnel created before v2.9.12 gets `-lanes 1` instead.
 
 Flags:
 
@@ -363,18 +411,23 @@ Flags:
 | `-k` | pre-shared key authenticating the stripe frames (required; the manager generates and provisions it) | — |
 | `-p` | base destination port of the striped pool | `40000` |
 | `-C` | number of destination ports in the pool | `400` |
-| `-N` | connection (striping) workers | `90` |
+| `-N` | connection (striping) workers; the client splits them across the lanes | `90`; the manager passes the instance's N raised to at least `512` |
+| `-lanes` | independent per-flow reliability lanes; **must be equal on both ends** | `1`; the manager passes the instance's lane count (`16` for tunnels created by v2.9.12+, `1` for older ones) |
+| `-w` | in-flight window, total across lanes (each lane gets `w / lanes`, clamped to 32–512) | `400`; the manager passes `2 × N` |
+| `-to` | dial / I/O timeout in ms; the client's retransmit backstop is twice this, at least 500 ms | `5000`; the manager passes `1500` |
+| `-F` | enable TCP Fast Open | off; the manager passes it |
 | `-dl` | download-side pool size | `0` (derive from `-N`) |
 | `-T` | tun device name | `tsstripe0` |
 | `-M` | tun MTU | `1400` |
 | `-s` | run as the server (listener) side; the client omits it | off |
-| `-u` | client→server chunk bytes | `6800` |
-| `-d` | server→client chunk bytes | `8600` |
+| `-u` | client→server chunk bytes | `6600` |
+| `-d` | server→client chunk bytes | `6600` |
 
 `-u`/`-d` set how much data each striped connection carries before it is
-retired. They are **hard-capped at 8656 bytes** (the on-wire ceiling of 8760 B
-minus the 104-byte frame header); any larger value is clamped down to 8656, so
-no single connection ever outlives a ~8760 B per-5-tuple byte cap.
+retired. They are **hard-capped at 6660 bytes** (an on-wire ceiling of 6800 B,
+five segments at a 1360-byte MSS floor, minus the 140-byte frame header); any
+larger value is clamped down to 6660, so no single connection ever outlives a
+~8760 B per-5-tuple byte cap.
 
 ### Creating an `ackless` tunnel
 

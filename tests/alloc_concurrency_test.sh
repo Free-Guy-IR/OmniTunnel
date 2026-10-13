@@ -15,7 +15,7 @@ extract() {
     }' "$SCRIPT"
 }
 
-eval "$(extract "alloc_and_create next_subnet_idx next_port alloc_port_span occupied_port_ranges remote_port_ranges type_port_span list_instances inst_conf inst_path inst_pf inst_exists validate_inst_name create_inst gen_key type_uses_key port_base")"
+eval "$(extract "alloc_and_create next_subnet_idx next_port alloc_port_span occupied_port_ranges remote_port_ranges type_port_span list_instances inst_conf inst_path inst_pf inst_exists validate_inst_name tok_re inst_name_ok create_inst gen_key type_uses_key port_base")"
 
 fail() { echo "FAIL: $1" >&2; exit 1; }
 die() { echo "DIE: $*" >&2; exit 1; }
