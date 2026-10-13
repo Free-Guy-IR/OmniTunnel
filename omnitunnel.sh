@@ -455,9 +455,6 @@ build_execstart() {
         echo "build_execstart: $TYPE requires a non-empty PSK but KEY is empty; refusing" >&2
         return 1
     fi
-    local sN=${NCONN:-16}
-    if [ "$sN" -lt 512 ]; then sN=512; fi
-    local sW=$(( sN * 2 ))
     case "$TYPE" in
         udp)  echo "$TSUITE_BIN udp -L $LOCAL_IP -R $PEER_IP -A $TUN_ADDR -P $PEER_ADDR -p $PORT -k $KEY -T $DEV -M $MTU";;
         tcp)  echo "$TSUITE_BIN tcp -L $LOCAL_IP -R $PEER_IP -A $TUN_ADDR -P $PEER_ADDR -p $PORT -k $KEY$sflag -T $DEV -M $MTU";;
@@ -467,7 +464,12 @@ build_execstart() {
         # reverse-mux rides the icmp engine with the reply type forced; the chisel
         # MUX layer lives in separate units (mux-add / mux-token), not here.
         reverse-mux) echo "$TSUITE_BIN icmp -L $LOCAL_IP -R $PEER_IP -A $TUN_ADDR -P $PEER_ADDR -I 4d54 -T $DEV -M $MTU$sflag -r ${ICMP_MODE:-reply}";;
-        stripe) echo "$OMNISTRIPE_BIN -L $LOCAL_IP -R $PEER_IP -A $TUN_ADDR -P $PEER_ADDR -k $KEY -p $PORT -C ${PCOUNT:-400} -N $sN -lanes ${LANES:-1} -w $sW -to 1500 -F -T $DEV -M $MTU$sflag";;
+        stripe)
+            local sN=512 sW
+            if tok_re "${NCONN:-}" '^0*[0-9]{1,9}$'; then sN=$(( 10#$NCONN )); fi
+            if (( sN < 512 )); then sN=512; fi
+            sW=$(( sN * 2 ))
+            echo "$OMNISTRIPE_BIN -L $LOCAL_IP -R $PEER_IP -A $TUN_ADDR -P $PEER_ADDR -k $KEY -p $PORT -C ${PCOUNT:-400} -N $sN -lanes ${LANES:-1} -w $sW -to 1500 -F -T $DEV -M $MTU$sflag";;
         ackless) echo "$OMNIACKLESS_BIN -L $LOCAL_IP -R $PEER_IP -A $TUN_ADDR -P $PEER_ADDR -k $KEY -p $PORT -T $DEV -M $MTU$sflag";;
     esac
 }

@@ -4,7 +4,7 @@ set -u
 SCRIPT="${1:-$(dirname "$0")/../omnitunnel.sh}"
 
 extract_funcs() {
-    grep -E '^type_uses_key\(\)' "$SCRIPT"
+    grep -E '^(type_uses_key|tok_re)\(\)' "$SCRIPT"
     awk '/^build_execstart\(\) \{/{f=1} f{print} f&&/^\}/{f=0}' "$SCRIPT"
 }
 
