@@ -36,6 +36,20 @@ const (
 	nackMax = 128
 )
 
+const (
+	nackTick     = 15 * time.Millisecond
+	nackGuardMin = 6 * time.Millisecond
+	nackGuardMax = 60 * time.Millisecond
+	nackRetryMin = 55 * time.Millisecond
+	nackRetryMax = time.Second
+	reoDecay     = 2 * time.Second
+	fillRingN    = 1024
+	tailIdle     = 120 * time.Millisecond
+	tailGap      = 100 * time.Millisecond
+	tailStall    = time.Second
+	tailBurst    = 128
+)
+
 var (
 	localIP   = flag.String("L", "", "local source/bind IP")
 	peerIP    = flag.String("R", "", "peer IP")
@@ -217,6 +231,8 @@ type txbuf struct {
 	reserved      uint32
 	sb            *sendBase
 	nBaseFail     uint64
+	cumMoveNanos  int64
+	tailGBN       bool
 }
 
 func newTxbuf(snd *sender, aadTx []byte) *txbuf {
@@ -301,8 +317,12 @@ func (t *txbuf) sendData(ip []byte) {
 	slot := seq % arqW
 	t.seqOf[slot] = seq
 	t.buf[slot] = p
+	now := time.Now().UnixNano()
+	if t.lastSent == t.ackedCum {
+		t.cumMoveNanos = now
+	}
 	t.lastSent = seq
-	t.lastSendNanos = time.Now().UnixNano()
+	t.lastSendNanos = now
 	t.mu.Unlock()
 	t.snd.send(p)
 	atomic.AddUint64(&t.nData, 1)
@@ -326,6 +346,7 @@ func (t *txbuf) setAckedCum(c uint32) {
 	t.mu.Lock()
 	if seqGt(c, t.ackedCum) && !seqGt(c, t.lastSent) {
 		t.ackedCum = c
+		t.cumMoveNanos = time.Now().UnixNano()
 		t.notAcked.Broadcast()
 	}
 	t.mu.Unlock()
@@ -336,37 +357,61 @@ func (t *txbuf) rtoLoop() {
 	defer tk.Stop()
 	for range tk.C {
 		t.sendBaseAdvert()
-		now := time.Now().UnixNano()
-		t.mu.Lock()
-		idle := now-t.lastSendNanos > int64(120*time.Millisecond)
-		need := seqGt(t.lastSent, t.ackedCum)
-		var list []uint32
-		if idle && need && now-t.lastTailNanos > int64(100*time.Millisecond) {
-			s := t.ackedCum + 1
-			n := 0
-			for (s == t.lastSent || seqGt(t.lastSent, s)) && n < 128 {
-				if t.seqOf[s%arqW] == s && t.buf[s%arqW] != nil {
-					list = append(list, s)
-				}
-				if s == t.lastSent {
-					break
-				}
-				s++
-				n++
-			}
-			t.lastTailNanos = now
-		}
-		t.mu.Unlock()
-		for _, s := range list {
+		for _, s := range t.tailDue(time.Now().UnixNano()) {
 			t.retransmit(s)
 		}
 	}
 }
 
+func (t *txbuf) held(s uint32) bool {
+	return t.seqOf[s%arqW] == s && t.buf[s%arqW] != nil
+}
+
+func (t *txbuf) tailDue(now int64) []uint32 {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if !seqGt(t.lastSent, t.ackedCum) {
+		t.tailGBN = false
+		return nil
+	}
+	if now-t.lastSendNanos <= int64(tailIdle) || now-t.lastTailNanos <= int64(tailGap) {
+		return nil
+	}
+	t.lastTailNanos = now
+	if !t.tailGBN && now-t.cumMoveNanos < int64(tailStall) {
+		if t.held(t.lastSent) {
+			return []uint32{t.lastSent}
+		}
+		return nil
+	}
+	t.tailGBN = true
+	var list []uint32
+	s := t.ackedCum + 1
+	for n := 0; n < tailBurst; n++ {
+		if t.held(s) {
+			list = append(list, s)
+		}
+		if s == t.lastSent {
+			break
+		}
+		s++
+	}
+	return list
+}
+
 type missInfo struct {
 	first time.Time
 	last  time.Time
+	wait  time.Duration
 	tries int
+}
+
+type fillRec struct {
+	seq   uint32
+	gen   uint32
+	first time.Time
+	fill  time.Time
+	ok    bool
 }
 
 type epochGuard struct {
@@ -523,6 +568,14 @@ type arqRx struct {
 	nReplay      uint64
 	nEpochReset  uint64
 	nCtrlDrop    uint64
+	nSpurious    uint64
+	srtt         time.Duration
+	rttvar       time.Duration
+	rto          time.Duration
+	backoffAt    time.Time
+	reo          time.Duration
+	reoAt        time.Time
+	fills        []fillRec
 }
 
 func newArqRx(tunFD int, snd *sender, tx *txbuf, aadRx, aadTxCtrl []byte, eg *epochGuard) *arqRx {
@@ -530,7 +583,8 @@ func newArqRx(tunFD int, snd *sender, tx *txbuf, aadRx, aadTxCtrl []byte, eg *ep
 		eg = &epochGuard{}
 	}
 	return &arqRx{tunFD: tunFD, snd: snd, tx: tx, eg: eg, aadRx: aadRx, aadTxCtrl: aadTxCtrl,
-		seqOf: make([]uint32, arqW), genOf: make([]uint32, arqW), miss: make(map[uint32]*missInfo), pend: make(map[uint32][]byte)}
+		seqOf: make([]uint32, arqW), genOf: make([]uint32, arqW), miss: make(map[uint32]*missInfo), pend: make(map[uint32][]byte),
+		fills: make([]fillRec, fillRingN)}
 }
 
 func (r *arqRx) writeTun(ip []byte) error {
@@ -584,8 +638,121 @@ func (r *arqRx) recordGap(from, to uint32) {
 	}
 }
 
+func clampDur(v, lo, hi time.Duration) time.Duration {
+	if v > hi {
+		v = hi
+	}
+	if v < lo {
+		v = lo
+	}
+	return v
+}
+
+func (r *arqRx) noteRTT(s time.Duration) {
+	if s <= 0 {
+		return
+	}
+	if r.srtt == 0 {
+		r.srtt = s
+		r.rttvar = s / 2
+	} else {
+		d := r.srtt - s
+		if d < 0 {
+			d = -d
+		}
+		r.rttvar += (d - r.rttvar) / 4
+		r.srtt += (s - r.srtt) / 8
+	}
+	v := 4 * r.rttvar
+	if v < nackTick {
+		v = nackTick
+	}
+	r.rto = clampDur(r.srtt+v, nackRetryMin, nackRetryMax)
+}
+
+func (r *arqRx) retryNow(floor time.Duration) time.Duration {
+	if r.rto > floor {
+		return r.rto
+	}
+	return floor
+}
+
+func (r *arqRx) backoff(now time.Time, floor time.Duration) {
+	cur := r.retryNow(floor)
+	if !r.backoffAt.IsZero() && now.Sub(r.backoffAt) < cur {
+		return
+	}
+	r.rto = clampDur(2*cur, floor, nackRetryMax)
+	r.backoffAt = now
+}
+
+func (r *arqRx) reoNow(now time.Time) time.Duration {
+	if r.reo == 0 {
+		return 0
+	}
+	k := now.Sub(r.reoAt) / reoDecay
+	if k <= 0 {
+		return r.reo
+	}
+	if k >= 32 {
+		r.reo = 0
+		return 0
+	}
+	r.reo >>= uint(k)
+	r.reoAt = r.reoAt.Add(k * reoDecay)
+	return r.reo
+}
+
+func (r *arqRx) noteReorder(l time.Duration, now time.Time) {
+	if l <= 0 || l > nackGuardMax {
+		return
+	}
+	cur := r.reoNow(now)
+	if l > cur {
+		r.reo = l
+		r.reoAt = now
+	} else if 2*l >= cur {
+		r.reoAt = now
+	}
+}
+
+func (r *arqRx) guardNow(now time.Time, floor time.Duration) time.Duration {
+	g := r.reoNow(now)
+	g += g / 4
+	if g > nackGuardMax {
+		g = nackGuardMax
+	}
+	if g < floor {
+		g = floor
+	}
+	return g
+}
+
+func (r *arqRx) sampleFill(seq uint32, mi *missInfo, now time.Time) {
+	switch mi.tries {
+	case 0:
+		r.noteReorder(now.Sub(mi.first), now)
+	case 1:
+		r.noteRTT(now.Sub(mi.last))
+		r.fills[seq%fillRingN] = fillRec{seq: seq, gen: r.gen, first: mi.first, fill: now, ok: true}
+	}
+}
+
+func (r *arqRx) noteDup(seq uint32) {
+	f := &r.fills[seq%fillRingN]
+	if !f.ok || f.seq != seq || f.gen != r.gen {
+		return
+	}
+	f.ok = false
+	atomic.AddUint64(&r.nSpurious, 1)
+	r.noteReorder(f.fill.Sub(f.first), time.Now())
+}
+
 func (r *arqRx) noteSeq(seq uint32) {
-	delete(r.miss, seq)
+	if mi, ok := r.miss[seq]; ok {
+		r.sampleFill(seq, mi, time.Now())
+		delete(r.miss, seq)
+	}
 	if !r.have {
 		r.have = true
 		r.maxSeq = seq
@@ -683,6 +850,7 @@ func (r *arqRx) handle(payload []byte) {
 	}
 	if typ == tData {
 		if r.have && !seqGt(seq, r.cumAck) {
+			r.noteDup(seq)
 			r.mu.Unlock()
 			atomic.AddUint64(&r.nDup, 1)
 			return
@@ -696,6 +864,7 @@ func (r *arqRx) handle(payload []byte) {
 		dup := r.genOf[slot] == r.gen && r.seqOf[slot] == seq
 		if *reorderMs <= 0 {
 			if dup {
+				r.noteDup(seq)
 				r.mu.Unlock()
 				atomic.AddUint64(&r.nDup, 1)
 				return
@@ -725,6 +894,7 @@ func (r *arqRx) handle(payload []byte) {
 		}
 		if dup || !seqGt(seq, r.next-1) {
 			if dup {
+				r.noteDup(seq)
 				atomic.AddUint64(&r.nDup, 1)
 			}
 		} else if seq == r.next {
@@ -849,15 +1019,25 @@ func (r *arqRx) reorderTimeout(now time.Time) {
 func (r *arqRx) nackDue(now time.Time, guard, retry time.Duration) []uint32 {
 	var list []uint32
 	r.mu.Lock()
+	g := r.guardNow(now, guard)
 	for s, mi := range r.miss {
-		if now.Sub(mi.first) < guard {
+		if now.Sub(mi.first) < g {
 			continue
 		}
-		if !mi.last.IsZero() && now.Sub(mi.last) < retry {
-			continue
+		wait := r.retryNow(retry)
+		if !mi.last.IsZero() {
+			if mi.wait > wait {
+				wait = mi.wait
+			}
+			if now.Sub(mi.last) < wait {
+				continue
+			}
+			r.backoff(now, retry)
+			wait = clampDur(2*wait, retry, nackRetryMax)
 		}
 		list = append(list, s)
 		mi.last = now
+		mi.wait = wait
 		mi.tries++
 		if len(list) >= 4096 {
 			break
@@ -868,15 +1048,13 @@ func (r *arqRx) nackDue(now time.Time, guard, retry time.Duration) []uint32 {
 }
 
 func (r *arqRx) nackLoop() {
-	tk := time.NewTicker(15 * time.Millisecond)
+	tk := time.NewTicker(nackTick)
 	defer tk.Stop()
-	guard := 6 * time.Millisecond
-	retry := 55 * time.Millisecond
 	ackEvery := 0
 	for range tk.C {
 		now := time.Now()
 		r.reorderTimeout(now)
-		list := r.nackDue(now, guard, retry)
+		list := r.nackDue(now, nackGuardMin, nackRetryMin)
 		r.mu.Lock()
 		snapGen := r.gen
 		r.mu.Unlock()
@@ -1280,8 +1458,19 @@ func statsLoop(flows []*flow) {
 	defer tk.Stop()
 	var lastDeliv uint64
 	for range tk.C {
-		var data, re, deliv, dup, nk, af, rp, er, cd uint64
+		var data, re, deliv, dup, nk, af, rp, er, cd, sp uint64
+		var gMax, rMax time.Duration
+		now := time.Now()
 		for _, f := range flows {
+			sp += atomic.LoadUint64(&f.rx.nSpurious)
+			f.rx.mu.Lock()
+			if g := f.rx.guardNow(now, nackGuardMin); g > gMax {
+				gMax = g
+			}
+			if rt := f.rx.retryNow(nackRetryMin); rt > rMax {
+				rMax = rt
+			}
+			f.rx.mu.Unlock()
 			data += atomic.LoadUint64(&f.tx.nData)
 			re += atomic.LoadUint64(&f.tx.nRe)
 			deliv += atomic.LoadUint64(&f.rx.nDeliv)
@@ -1294,10 +1483,10 @@ func statsLoop(flows []*flow) {
 		}
 		dd := deliv - lastDeliv
 		lastDeliv = deliv
-		fmt.Printf("stats N=%d txData=%d txRe=%d rxDeliv=%d rxDup=%d rxNack=%d authFail=%d replay=%d epochReset=%d ctrlDrop=%d rxMbit~=%.1f reRatio=%.3f\n",
+		fmt.Printf("stats N=%d txData=%d txRe=%d rxDeliv=%d rxDup=%d rxNack=%d authFail=%d replay=%d epochReset=%d ctrlDrop=%d rxMbit~=%.1f reRatio=%.3f rxSpur=%d nackGuardMs=%.1f nackRtoMs=%.1f\n",
 			atomic.LoadInt32(&activeN), data, re, deliv, dup, nk, af, rp, er, cd,
 			float64(dd)*float64(*mtu)*8/1e6/float64(*statsSec),
-			ratio(re, data))
+			ratio(re, data), sp, float64(gMax)/1e6, float64(rMax)/1e6)
 	}
 }
 
