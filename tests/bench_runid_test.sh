@@ -17,7 +17,7 @@ extract() {
     }' "$SCRIPT"
 }
 
-eval "$(extract "tok_re lanes_ok inst_name_ok create_id_ok new_create_id inst_create_lock inst_create_unlock type_is_hysteria type_is_stripe type_is_ackless type_is_kernel type_is_revmux type_uses_key inst_path inst_conf inst_pf inst_exists list_instances validate_inst_name norm_port create_inst cmd_peercreate cmd_remove_own peer_inst_state peer_remove_own bench_peer_create bench_peer_remove bench_create_id bench_reg_file bench_reg_lock bench_id_lock bench_reg_add bench_reg_del bench_abandoned_ids bench_clean_abandoned bench_run_done gen_key")"
+eval "$(extract "tok_re lanes_ok inst_name_ok create_id_ok new_create_id inst_create_lock inst_create_unlock type_is_hysteria type_is_stripe type_is_ackless type_is_kernel type_is_revmux type_uses_key inst_path inst_conf inst_pf inst_exists list_instances validate_inst_name norm_port create_inst cmd_peercreate cmd_remove_own peer_inst_state peer_remove_own bench_peer_create bench_peer_remove bench_peer_remove_confirm bench_create_id bench_reg_file bench_reg_lock bench_id_lock bench_reg_add bench_reg_del bench_abandoned_ids bench_migrate_legacy bench_clean_abandoned bench_run_done gen_key")"
 eval "$(grep -m1 '^ALL_TYPES=' "$SCRIPT")"
 
 DISPATCH="$(grep -E '^[[:space:]]+(_peercreate|_remove_own|_remove)\)' "$SCRIPT")"
@@ -48,82 +48,90 @@ C_BOLD=""; C_RESET=""; C_GREY=""; C_BGRN=""; C_CYAN=""; C_GREEN=""; C_DIM=""
 
 K="$(printf 'e%.0s' {1..64})"
 SEED="0123456789abcdef0123456789abcdef"
+AB="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+LV="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+LG="cccccccccccccccccccccccccccccccc"
+MYID="dddddddddddddddddddddddddddddddd"
+HX="203.0.113.9"
+HY="198.51.100.9"
 
-FOREIGN=""
+FOREIGN=""; FAIL_REMOVE=""
 omni_in() { local d="$1"; shift; ( set -euo pipefail; INST_DIR="$d"; omni "$@" ); }
 peer_ssh() {
-    local c="$2"
+    local host="$1" c="$2"
     case "$c" in
         "uname -m") echo x86_64;;
         *"omnitunnel.sh _peercreate "*) eval "set -- ${c#*omnitunnel.sh _peercreate }"; omni_in "$FOREIGN" _peercreate "$@";;
-        *"omnitunnel.sh _remove_own "*) eval "set -- ${c#*omnitunnel.sh _remove_own }"; omni_in "$FOREIGN" _remove_own "$@";;
+        *"omnitunnel.sh _remove_own "*)
+            if [[ -n "${FAIL_REMOVE:-}" && "$host" == "$FAIL_REMOVE" ]]; then return 255; fi
+            eval "set -- ${c#*omnitunnel.sh _remove_own }"; omni_in "$FOREIGN" _remove_own "$@";;
         *) :;;
     esac
 }
-foreign_cid() { grep -m1 '^CREATE_ID=' "$FOREIGN/$1/instance.conf" 2>/dev/null | cut -d= -f2; }
+seed_inst() { omni_in "$1" _peercreate "$3" udp server 203.0.113.9 1.2.3.4 28900 "$K" 10.201.9.2 10.201.9.1 none 8 "" "" "" "$2" >/dev/null 2>&1; }
+reg_has() { awk -v x="$1" '$1==x{f=1} END{exit !f}' "$2" 2>/dev/null; }
 wait_file() { local f="$1" n=0; while [[ ! -e "$f" ]]; do sleep 0.002; n=$((n+1)); [[ $n -gt 20000 ]] && break; done; }
 
-interleave_once() {
-    local tag="$1" R F dA dB idA idB rid
-    R="$WORK/$tag.r"; F="$WORK/$tag.f"
-    mkdir -p "$R" "$F"
-    printf '%s\n' "$SEED" > "$R/bench.id"
-    dA="0.00$((RANDOM % 6))"; dB="0.00$((RANDOM % 6))"
-    (
-        wait_file "$WORK/$tag.go"; sleep "$dA"
-        ROOT_DIR="$R"; FOREIGN="$F"; BENCH_ID=""
-        local a; a="$(bench_create_id)"; printf '%s' "$a" > "$WORK/$tag.a"
-        bench_peer_create 203.0.113.9 "$a" bench-udp udp server 203.0.113.9 1.2.3.4 28900 "$K" 10.201.9.2 10.201.9.1 none 8 "" "" "" >/dev/null 2>&1
-        touch "$WORK/$tag.adone"
-    ) &
-    (
-        wait_file "$WORK/$tag.go"; wait_file "$WORK/$tag.adone"; sleep "$dB"
-        ROOT_DIR="$R"; FOREIGN="$F"; BENCH_ID=""
-        local b; b="$(bench_create_id)"; printf '%s' "$b" > "$WORK/$tag.b"
-        bench_peer_remove 203.0.113.9 "$b" bench-udp
-    ) &
-    touch "$WORK/$tag.go"; wait
-    idA="$(cat "$WORK/$tag.a" 2>/dev/null)"; idB="$(cat "$WORK/$tag.b" 2>/dev/null)"
-    [[ -n "$idA" && -n "$idB" ]] || fail "$tag: one of the concurrent runs produced no benchmark id (A='$idA' B='$idB')"
-    [[ -e "$F/bench-udp/instance.conf" ]] || fail "$tag: run B's benchmark cleanup removed run A's live foreign bench-udp (A=$idA B=$idB)"
-    rid="$(grep -m1 '^CREATE_ID=' "$F/bench-udp/instance.conf" 2>/dev/null | cut -d= -f2)"
-    [[ "$rid" == "$idA" ]] || fail "$tag: run A's foreign bench-udp CREATE_ID is '$rid', not run A's id '$idA' (B clobbered it)"
-    [[ "$idA" != "$idB" ]] || fail "$tag: two concurrent benchmarks from one relay shared one creation id ($idA)"
+case_interleave() {
+    local i R F dA dB idA idB rid
+    for ((i=0; i<ITER; i++)); do
+        R="$WORK/il$i.r"; F="$WORK/il$i.f"; mkdir -p "$R" "$F"
+        printf '%s\n' "$SEED" > "$R/bench.id"
+        dA="0.00$((RANDOM % 6))"; dB="0.00$((RANDOM % 6))"
+        (
+            wait_file "$WORK/il$i.go"; sleep "$dA"
+            ROOT_DIR="$R"; FOREIGN="$F"; BENCH_ID=""
+            local a; a="$(bench_create_id "$HX")"; printf '%s' "$a" > "$WORK/il$i.a"
+            bench_peer_create 203.0.113.9 "$a" bench-udp udp server 203.0.113.9 1.2.3.4 28900 "$K" 10.201.9.2 10.201.9.1 none 8 "" "" "" >/dev/null 2>&1
+            touch "$WORK/il$i.adone"
+        ) &
+        (
+            wait_file "$WORK/il$i.go"; wait_file "$WORK/il$i.adone"; sleep "$dB"
+            ROOT_DIR="$R"; FOREIGN="$F"; BENCH_ID=""
+            local b; b="$(bench_create_id "$HX")"; printf '%s' "$b" > "$WORK/il$i.b"
+            bench_peer_remove 203.0.113.9 "$b" bench-udp
+        ) &
+        touch "$WORK/il$i.go"; wait
+        idA="$(cat "$WORK/il$i.a" 2>/dev/null)"; idB="$(cat "$WORK/il$i.b" 2>/dev/null)"
+        [[ -n "$idA" && -n "$idB" ]] || fail "interleave: a concurrent run produced no id (A='$idA' B='$idB')"
+        [[ -e "$F/bench-udp/instance.conf" ]] || fail "interleave: run B removed run A's live foreign bench-udp (A=$idA B=$idB)"
+        rid="$(grep -m1 '^CREATE_ID=' "$F/bench-udp/instance.conf" 2>/dev/null | cut -d= -f2)"
+        [[ "$rid" == "$idA" ]] || fail "interleave: run A's bench-udp CREATE_ID is '$rid', not run A's id '$idA'"
+        [[ "$idA" != "$idB" ]] || fail "interleave: two concurrent benchmarks shared one creation id ($idA)"
+    done
+    echo "interleave: $ITER concurrent pairs, no cross-removal"
 }
 
-unit_distinct() {
+case_unit() {
     local R a b
     R="$WORK/u.r"; mkdir -p "$R"
-    printf '%s\n' "$SEED" > "$R/bench.id"
-    a="$( ROOT_DIR="$R"; BENCH_ID=""; bench_create_id )"
-    b="$( ROOT_DIR="$R"; BENCH_ID=""; bench_create_id )"
-    create_id_ok "$a" || fail "unit: bench_create_id returned a malformed id '$a'"
-    create_id_ok "$b" || fail "unit: bench_create_id returned a malformed id '$b'"
-    [[ "$a" != "$b" ]] || fail "unit: bench_create_id returned the same id on two runs (must be distinct per run)"
-    [[ "$a" != "$SEED" && "$b" != "$SEED" ]] || fail "unit: bench_create_id reused the shared per-relay bench.id instead of a fresh run id"
-    grep -qxF "$a" "$R/bench.ids" || fail "unit: bench_create_id did not record run id '$a' in the registry"
-    grep -qxF "$b" "$R/bench.ids" || fail "unit: bench_create_id did not record run id '$b' in the registry"
-    [[ "$(stat -c %a "$R/bench.ids")" == 600 ]] || fail "unit: the bench id registry is not mode 600"
+    a="$( ROOT_DIR="$R"; BENCH_ID=""; bench_create_id "$HX" )"
+    b="$( ROOT_DIR="$R"; BENCH_ID=""; bench_create_id "$HX" )"
+    create_id_ok "$a" || fail "unit: malformed id '$a'"
+    create_id_ok "$b" || fail "unit: malformed id '$b'"
+    [[ "$a" != "$b" ]] || fail "unit: bench_create_id must be distinct per run, got the same twice"
+    [[ "$a" != "$SEED" ]] || fail "unit: bench_create_id reused a shared id"
+    reg_has "$a" "$R/bench.ids" || fail "unit: run id '$a' not recorded in the registry"
+    reg_has "$b" "$R/bench.ids" || fail "unit: run id '$b' not recorded in the registry"
+    [[ "$(stat -c %a "$R/bench.ids")" == 600 ]] || fail "unit: registry is not mode 600"
 }
 
-crash_abandoned() {
-    local R F AB
-    R="$WORK/ab.r"; F="$WORK/ab.f"; AB="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-    mkdir -p "$R" "$F"
-    printf '%s\n' "$AB" > "$R/bench.ids"; chmod 600 "$R/bench.ids"
+case_crash() {
+    local R F
+    R="$WORK/cr.r"; F="$WORK/cr.f"; mkdir -p "$R" "$F"
+    ( ROOT_DIR="$R"; bench_reg_add "$AB" "$HX" )
     : > "$R/bench.$AB.lock"
-    omni_in "$F" _peercreate bench-udp udp server 203.0.113.9 1.2.3.4 28900 "$K" 10.201.9.2 10.201.9.1 none 8 "" "" "" "$AB" >/dev/null 2>&1 || fail "crash: could not seed the abandoned foreign instance"
-    ( ROOT_DIR="$R"; FOREIGN="$F"; BENCH_ID="cccccccccccccccccccccccccccccccc"; bench_clean_abandoned 203.0.113.9 )
-    [[ ! -e "$F/bench-udp/instance.conf" ]] || fail "crash: bench_clean_abandoned did not remove an abandoned run's foreign bench-udp"
-    ! grep -qxF "$AB" "$R/bench.ids" 2>/dev/null || fail "crash: bench_clean_abandoned did not drop the abandoned id from the registry"
+    seed_inst "$F" "$AB" bench-udp || fail "crash: could not seed abandoned instance"
+    ( ROOT_DIR="$R"; FOREIGN="$F"; BENCH_ID="$MYID"; bench_clean_abandoned "$HX" )
+    [[ ! -e "$F/bench-udp/instance.conf" ]] || fail "crash: abandoned run's foreign bench-udp was not removed"
+    ! reg_has "$AB" "$R/bench.ids" || fail "crash: abandoned id was not dropped from the registry after a confirmed removal"
 }
 
-live_protected() {
-    local R F LV holder n
-    R="$WORK/lv.r"; F="$WORK/lv.f"; LV="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-    mkdir -p "$R" "$F"
-    printf '%s\n' "$LV" > "$R/bench.ids"; chmod 600 "$R/bench.ids"
-    omni_in "$F" _peercreate bench-udp udp server 203.0.113.9 1.2.3.4 28900 "$K" 10.201.9.2 10.201.9.1 none 8 "" "" "" "$LV" >/dev/null 2>&1 || fail "live: could not seed the live foreign instance"
+case_live() {
+    local R F holder n
+    R="$WORK/lv.r"; F="$WORK/lv.f"; mkdir -p "$R" "$F"
+    ( ROOT_DIR="$R"; bench_reg_add "$LV" "$HX" )
+    seed_inst "$F" "$LV" bench-udp || fail "live: could not seed live instance"
     (
         exec {hfd}>"$R/bench.$LV.lock" 2>/dev/null
         flock "$hfd" 2>/dev/null
@@ -133,22 +141,60 @@ live_protected() {
     holder=$!
     : > "$R/go"
     n=0; while [[ ! -e "$R/held" ]]; do sleep 0.01; n=$((n+1)); [[ $n -gt 2000 ]] && break; done
-    ( ROOT_DIR="$R"; FOREIGN="$F"; BENCH_ID="cccccccccccccccccccccccccccccccc"; bench_clean_abandoned 203.0.113.9 )
+    ( ROOT_DIR="$R"; FOREIGN="$F"; BENCH_ID="$MYID"; bench_clean_abandoned "$HX" )
     rm -f "$R/go"; wait "$holder" 2>/dev/null
-    [[ -e "$F/bench-udp/instance.conf" ]] || fail "live: bench_clean_abandoned removed a LIVE concurrent run's foreign bench-udp"
-    grep -qxF "$LV" "$R/bench.ids" 2>/dev/null || fail "live: bench_clean_abandoned dropped a live run's id from the registry"
+    [[ -e "$F/bench-udp/instance.conf" ]] || fail "live: a LIVE concurrent run's foreign bench-udp was removed"
+    reg_has "$LV" "$R/bench.ids" || fail "live: a live run's id was dropped from the registry"
 }
 
-empty_noop() {
+case_empty() {
     local R F
     R="$WORK/e.r"; F="$WORK/e.f"; mkdir -p "$R" "$F"
-    ( ROOT_DIR="$R"; FOREIGN="$F"; BENCH_ID=""; bench_clean_abandoned 203.0.113.9 ) || fail "empty: bench_clean_abandoned failed with an empty registry"
+    ( ROOT_DIR="$R"; FOREIGN="$F"; BENCH_ID=""; bench_clean_abandoned "$HX" ) || fail "empty: non-zero exit on an empty registry"
 }
 
-for ((i=0; i<ITER; i++)); do interleave_once "il$i"; done
-unit_distinct
-crash_abandoned
-live_protected
-empty_noop
+case_crosshost() {
+    local R F
+    R="$WORK/ch.r"; F="$WORK/ch.f"; mkdir -p "$R" "$F"
+    ( ROOT_DIR="$R"; bench_reg_add "$AB" "$HX" )
+    : > "$R/bench.$AB.lock"
+    seed_inst "$F" "$AB" bench-udp || fail "crosshost: could not seed hostX instance"
+    ( ROOT_DIR="$R"; FOREIGN="$WORK/ch.fy"; mkdir -p "$FOREIGN"; BENCH_ID="$MYID"; bench_clean_abandoned "$HY" )
+    reg_has "$AB" "$R/bench.ids" || fail "crosshost: run B on a DIFFERENT host dropped run A's abandoned id (orphaning A's instances on its own host)"
+    [[ -e "$F/bench-udp/instance.conf" ]] || fail "crosshost: run B removed run A's foreign bench-udp on the other host"
+}
 
-echo "PASSED - each benchmark run gets a distinct creation id: $ITER concurrent benchmark pairs from one relay never remove each other's foreign bench instance, two runs' ids are always distinct and recorded in the registry, an abandoned run's leftovers are cleaned while a live concurrent run's instance is left untouched, and an empty registry is a no-op"
+case_failremove() {
+    local R F
+    R="$WORK/fr.r"; F="$WORK/fr.f"; mkdir -p "$R" "$F"
+    ( ROOT_DIR="$R"; bench_reg_add "$AB" "$HX" )
+    : > "$R/bench.$AB.lock"
+    seed_inst "$F" "$AB" bench-udp || fail "failremove: could not seed instance"
+    ( ROOT_DIR="$R"; FOREIGN="$F"; FAIL_REMOVE="$HX"; BENCH_ID="$MYID"; bench_clean_abandoned "$HX" )
+    reg_has "$AB" "$R/bench.ids" || fail "failremove: an abandoned id was dropped although its foreign removal failed"
+    [[ -e "$F/bench-udp/instance.conf" ]] || fail "failremove: the foreign instance vanished although removal was supposed to fail"
+}
+
+case_legacy() {
+    local R F
+    R="$WORK/lg.r"; F="$WORK/lg.f"; mkdir -p "$R" "$F"
+    printf '%s\n' "$LG" > "$R/bench.id"
+    seed_inst "$F" "$LG" bench-udp || fail "legacy: could not seed legacy instance"
+    ( ROOT_DIR="$R"; FOREIGN="$F"; BENCH_ID="$MYID"; bench_clean_abandoned "$HX" )
+    [[ ! -e "$R/bench.id" ]] || fail "legacy: a crashed 2.9.12 bench.id was left in place (never migrated/cleaned)"
+    [[ ! -e "$F/bench-udp/instance.conf" ]] || fail "legacy: the legacy bench.id's foreign leftovers were not cleaned"
+    ! reg_has "$LG" "$R/bench.ids" || fail "legacy: the migrated legacy id was not dropped after a confirmed removal"
+}
+
+RESULTS=(); BAD=0
+run_case() {
+    local id="$1" out rc=0
+    out="$( "case_$id" 2>&1 )" || rc=$?
+    if [[ $rc -eq 0 ]]; then RESULTS+=("PASS ($id)${out:+ - $(tail -n1 <<<"$out")}")
+    else RESULTS+=("FAIL ($id): $(grep -m1 '^FAIL' <<<"$out" || tail -n1 <<<"$out")"); BAD=1; fi
+}
+
+for c in interleave unit crash live empty crosshost failremove legacy; do run_case "$c"; done
+printf '%s\n' "${RESULTS[@]}"
+[[ $BAD -eq 0 ]] || { echo "bench_runid_test FAILED" >&2; exit 1; }
+echo "PASSED - distinct per-run benchmark ids ($ITER concurrent pairs never cross-remove), host-tagged registry with flock liveness: an abandoned id is dropped only after a CONFIRMED same-host removal, kept when the host differs (crosshost) or the removal fails (failremove), a live concurrent run is untouched, and a legacy 2.9.12 bench.id is migrated and cleaned"

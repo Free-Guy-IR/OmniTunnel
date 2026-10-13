@@ -2052,9 +2052,9 @@ bench_reg_file() { echo "$ROOT_DIR/bench.ids"; }
 bench_reg_lock() { echo "$ROOT_DIR/.bench.ids.lock"; }
 bench_id_lock() { echo "$ROOT_DIR/bench.$1.lock"; }
 bench_reg_add() {
-    local id="$1"
+    local id="$1" host="${2:-}"
     mkdir -p "$ROOT_DIR" 2>/dev/null || true
-    ( umask 077; printf '%s\n' "$id" >> "$(bench_reg_file)" && chmod 600 "$(bench_reg_file)" ) 2>/dev/null || true
+    ( umask 077; printf '%s %s\n' "$id" "$host" >> "$(bench_reg_file)" && chmod 600 "$(bench_reg_file)" ) 2>/dev/null || true
 }
 bench_reg_del() {
     local id="$1" reg tmp
@@ -2063,38 +2063,57 @@ bench_reg_del() {
         if exec {rfd}>"$(bench_reg_lock)" 2>/dev/null; then flock "$rfd" 2>/dev/null || true; fi
         [[ -r "$reg" ]] || exit 0
         tmp="$(mktemp "$ROOT_DIR/.bench.ids.XXXXXX" 2>/dev/null)" || exit 0
-        grep -vxF "$id" "$reg" 2>/dev/null > "$tmp" || true
+        awk -v id="$id" '$1 != id' "$reg" 2>/dev/null > "$tmp" || true
         chmod 600 "$tmp" 2>/dev/null || true
         mv -f "$tmp" "$reg" 2>/dev/null || rm -f "$tmp" 2>/dev/null
     ) 2>/dev/null || true
     rm -f "$(bench_id_lock "$id")" 2>/dev/null || true
 }
 bench_create_id() {
-    local id
+    local id host="${1:-}"
     id="$(new_create_id)" || return 1
     mkdir -p "$ROOT_DIR" 2>/dev/null || true
     BENCH_ID="$id"
     if exec {BENCH_LOCK_FD}>"$(bench_id_lock "$id")" 2>/dev/null; then flock "$BENCH_LOCK_FD" 2>/dev/null || true; fi
-    bench_reg_add "$id"
+    bench_reg_add "$id" "$host"
     printf '%s' "$id"
 }
 bench_abandoned_ids() {
-    local reg id fd; reg="$(bench_reg_file)"; [[ -r "$reg" ]] || return 0
-    while IFS= read -r id; do
+    local h="$1" reg id host fd
+    reg="$(bench_reg_file)"; [[ -r "$reg" ]] || return 0
+    while read -r id host _; do
         create_id_ok "$id" || continue
         [[ "$id" == "${BENCH_ID:-}" ]] && continue
+        [[ "$host" == "$h" ]] || continue
         if ( exec {fd}>"$(bench_id_lock "$id")" 2>/dev/null && flock -n "$fd" 2>/dev/null ); then
             printf '%s\n' "$id"
         fi
     done < "$reg"
 }
+bench_peer_remove_confirm() {
+    local h="$1" id="$2" name="$3" rc=0
+    peer_ssh "$h" "OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh _remove_own '$name' '$id'" >/dev/null 2>&1 || rc=$?
+    case "$rc" in 0|3|4) return 0;; *) return 1;; esac
+}
+bench_migrate_legacy() {
+    local h="$1" lf lid
+    lf="$ROOT_DIR/bench.id"
+    [[ -r "$lf" ]] || return 0
+    lid="$(tr -d ' \r\n' < "$lf" 2>/dev/null)" || lid=""
+    create_id_ok "$lid" && bench_reg_add "$lid" "$h"
+    rm -f "$lf" 2>/dev/null || true
+}
 bench_clean_abandoned() {
-    local h="$1" aid t ids
-    ids="$(bench_abandoned_ids)" || true
+    local h="$1" aid t ids ok
+    bench_migrate_legacy "$h"
+    ids="$(bench_abandoned_ids "$h")" || true
     [[ -n "$ids" ]] || return 0
     for aid in $ids; do
-        for t in $ALL_TYPES; do bench_peer_remove "$h" "$aid" "bench-$t"; done
-        bench_reg_del "$aid"
+        ok=1
+        for t in $ALL_TYPES; do
+            bench_peer_remove_confirm "$h" "$aid" "bench-$t" || ok=0
+        done
+        [[ "$ok" == 1 ]] && bench_reg_del "$aid"
     done
 }
 bench_run_done() {
@@ -2206,7 +2225,7 @@ bench_run() {
     hy_target=$(awk -v s="$raw_dl" 'BEGIN{ n=s+0; if (s ~ /Kbits/) n/=1000; else if (s ~ /Gbits/) n*=1000; t=int(n*0.9); if (t<200) t=200; if (t>2000) t=2000; print t }')
     printf "  %bhysteria Brutal-CC target auto-scaled to %s mbps%b\n" "$C_GREY" "$hy_target" "$C_RESET"
 
-    bench_create_id >/dev/null || { warn "cannot create the benchmark id in $ROOT_DIR"; return 1; }
+    bench_create_id "$fhost" >/dev/null || { warn "cannot create the benchmark id in $ROOT_DIR"; return 1; }
     local bid="$BENCH_ID"
     bench_clean_abandoned "$fhost" || true
     echo; printf "%b\n" "${C_BOLD}Benchmarking each tunnel (a few minutes)...${C_RESET}"

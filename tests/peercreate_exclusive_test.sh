@@ -17,7 +17,7 @@ extract() {
     }' "$SCRIPT"
 }
 
-eval "$(extract "tok_re lanes_ok inst_name_ok create_id_ok new_create_id inst_create_lock inst_create_unlock type_is_hysteria type_is_stripe type_is_ackless type_is_kernel type_is_revmux type_uses_key inst_path inst_conf inst_pf inst_exists list_instances create_inst cmd_peercreate cmd_remove_own provision_peer peer_inst_state peer_remove_own bench_run bench_create_id bench_reg_file bench_reg_lock bench_id_lock bench_reg_add bench_reg_del bench_abandoned_ids bench_clean_abandoned bench_run_done bench_peer_create bench_peer_remove bench_far_busy gen_key port_base type_port_span occupied_port_ranges alloc_port_span next_port next_subnet_idx mux_conf pick_num")"
+eval "$(extract "tok_re lanes_ok inst_name_ok create_id_ok new_create_id inst_create_lock inst_create_unlock type_is_hysteria type_is_stripe type_is_ackless type_is_kernel type_is_revmux type_uses_key inst_path inst_conf inst_pf inst_exists list_instances create_inst cmd_peercreate cmd_remove_own provision_peer peer_inst_state peer_remove_own bench_run bench_create_id bench_reg_file bench_reg_lock bench_id_lock bench_reg_add bench_reg_del bench_abandoned_ids bench_migrate_legacy bench_peer_remove_confirm bench_clean_abandoned bench_run_done bench_peer_create bench_peer_remove bench_far_busy gen_key port_base type_port_span occupied_port_ranges alloc_port_span next_port next_subnet_idx mux_conf pick_num")"
 eval "$(grep -m1 '^ALL_TYPES=' "$SCRIPT")"
 
 DISPATCH="$(grep -E '^[[:space:]]+(_peercreate|_remove_own|_remove)\)' "$SCRIPT")"
@@ -360,7 +360,7 @@ case_i() {
     rm -f "$ROOT_DIR/bench.ids" "$ROOT_DIR"/bench.*.lock 2>/dev/null
     u1="$(bench_create_id)" || fail "bench_create_id failed"
     create_id_ok "$u1" || fail "bench_create_id returned a malformed id '$u1'"
-    grep -qxF "$u1" "$ROOT_DIR/bench.ids" || fail "bench_create_id did not record its run id in the registry"
+    awk -v x="$u1" '$1==x{f=1} END{exit !f}' "$ROOT_DIR/bench.ids" || fail "bench_create_id did not record its run id in the registry"
     [[ "$(stat -c %a "$ROOT_DIR/bench.ids")" == 600 ]] || fail "the bench id registry is not mode 600"
     u2="$(bench_create_id)" || fail "bench_create_id failed on a second run"
     create_id_ok "$u2" || fail "bench_create_id returned a malformed id '$u2'"
