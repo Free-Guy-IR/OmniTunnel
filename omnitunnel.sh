@@ -1474,8 +1474,10 @@ guard_peer_downgrade() {
 
 # push the manager + the peer's own-arch binary, then bring up the server side
 provision_peer() {
-    local h="$1" name="$2" t="$3" plip="$4" prip="$5" port="$6" key="$7" pta="$8" ppa="$9" shape="${10}" nc="${11}" imode="${12:-}" lanes="${13:-1}"
+    local h="$1" name="$2" t="$3" plip="$4" prip="$5" port="$6" key="$7" pta="$8" ppa="$9" shape="${10}" nc="${11}" imode="${12:-}" lanes="${13:-1}" cid
     lanes_ok "$lanes" || die "invalid lane count '$lanes' (want 1..64)"
+    inst_name_ok "$name" || die "invalid instance name '$name'"
+    cid="$(new_create_id)" || die "cannot generate a creation id for '$name'"
     local parch; parch=$(peer_ssh "$h" "uname -m" 2>/dev/null | tr -d '\r')
     case "$parch" in x86_64|amd64) parch=amd64;; aarch64|arm64) parch=arm64;; *) die "peer $h has unsupported CPU: $parch";; esac
     info "  far side is $parch; deploying engine + manager to $h ..."
@@ -1504,25 +1506,97 @@ provision_peer() {
         peer_scp "$h" "$pbin" "/opt/omnitunnel/bin/omnitun-$parch"
         peer_ssh "$h" "chmod +x /opt/omnitunnel/bin/omnitun-$parch; install -m0755 /opt/omnitunnel/bin/omnitun-$parch /usr/local/bin/omnitun"
     fi
-    peer_ssh "$h" "OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh _peercreate '$name' '$t' server '$plip' '$prip' '$port' '$key' '$pta' '$ppa' '$shape' '$nc' '$imode' '' '$lanes'"
+    peer_ssh "$h" "OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh _peercreate '$name' '$t' server '$plip' '$prip' '$port' '$key' '$pta' '$ppa' '$shape' '$nc' '$imode' '' '$lanes' '$cid'" \
+        || die "the foreign $h did not create '$name' (see its message above); nothing was set up on this box"
     type_is_stripe "$t" || return 0
     local plane
     plane=$(peer_ssh "$h" "grep -m1 -E '^LANES=' /etc/omnitunnel/inst/'$name'/instance.conf" 2>/dev/null | tr -d '\r' || true)
     [[ "$plane" == "LANES=$lanes" ]] && return 0
     [[ -z "$plane" && "$lanes" == 1 ]] && return 0
-    peer_ssh "$h" "OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh _remove '$name'" >/dev/null 2>&1 || true
-    die "the foreign $h did not record lane count $lanes for '$name' (it has '${plane:-no LANES line}'), so its manager is not v$VERSION; the foreign side was removed - update the foreign and retry"
+    peer_remove_own "$h" "$name" "$cid"
+    die "the foreign $h did not record lane count $lanes for '$name' (it has '${plane:-no LANES line}'), so its manager is not v$VERSION; $PEER_CLEANUP_MSG - update the foreign and retry"
+}
+peer_inst_state() {
+    local out rc=0 id
+    out="$(peer_ssh "$1" "f=/etc/omnitunnel/inst/'$2'/instance.conf; if test -e \"\$f\"; then echo OMNIPRESENT; grep -m1 '^CREATE_ID=' \"\$f\" || true; else echo OMNIABSENT; fi" 2>/dev/null)" || rc=$?
+    out="${out//$'\r'/}"
+    [[ $rc -eq 0 ]] || { echo unknown; return 0; }
+    case "$out" in
+        OMNIABSENT) echo absent;;
+        OMNIPRESENT$'\n'CREATE_ID=*)
+            id="${out#*CREATE_ID=}"
+            if [[ "$id" == "$3" ]]; then echo ours
+            elif create_id_ok "$id"; then echo other
+            else echo unknown; fi;;
+        *) echo unknown;;
+    esac
+}
+peer_remove_own() {
+    local h="$1" name="$2" cid="$3" st
+    peer_ssh "$h" "OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh _remove_own '$name' '$cid'" >/dev/null 2>&1 || true
+    st="$(peer_inst_state "$h" "$name" "$cid")"
+    case "$st" in
+        absent) PEER_CLEANUP_MSG="the foreign side was removed";;
+        other)  PEER_CLEANUP_MSG="this run's foreign side is gone and the '$name' now on the foreign belongs to another run, so it was left as is";;
+        *)      PEER_CLEANUP_MSG="the foreign side may still exist - check it on the foreign and, if it is this tunnel's server side, remove it there with: omnitunnel remove $name";;
+    esac
+}
+create_id_ok() { tok_re "$1" '^[0-9a-f]{32}$'; }
+new_create_id() {
+    local id
+    id="$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+    create_id_ok "$id" || return 1
+    printf '%s' "$id"
+}
+inst_create_lock() {
+    mkdir -p "$INST_DIR" 2>/dev/null || true
+    exec {INST_LOCK_FD}>"$INST_DIR/.create.lock" || die "cannot open the instance lock $INST_DIR/.create.lock"
+    flock -w 300 "$INST_LOCK_FD" || die "timed out waiting for the instance lock $INST_DIR/.create.lock"
+}
+inst_create_unlock() {
+    flock -u "$INST_LOCK_FD" 2>/dev/null || true
+    exec {INST_LOCK_FD}>&-
 }
 cmd_peercreate() {
     need_root
-    local lanes="${14:-1}"
+    local lanes="${14:-1}" cid="${15:-}"
     lanes_ok "$lanes" || die "invalid lane count '$lanes' (want 1..64)"
+    [[ -z "$cid" ]] || create_id_ok "$cid" || die "invalid creation id '$cid' (want 32 lowercase hex digits)"
+    inst_name_ok "${1:-}" || die "invalid instance name '${1:-}'"
+    inst_exists "$1" && die "instance '$1' already exists on this server"
     if type_is_hysteria "$2"; then ensure_hysteria
     elif type_is_stripe "$2"; then ensure_omnistripe
     elif type_is_ackless "$2"; then ensure_omniackless
     elif ! type_is_kernel "$2"; then ensure_binary; fi
+    inst_create_lock
+    inst_exists "$1" && die "instance '$1' already exists on this server"
     create_inst "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" "${10}" "${11}" "${12:-}" "${13:-400}" "$lanes"
+    [[ -z "$cid" ]] || printf 'CREATE_ID=%s\n' "$cid" >> "$(inst_conf "$1")"
+    inst_create_unlock
     inst_enable "$1" >/dev/null 2>&1 || true; ok "peer instance '$1' up"
+}
+cmd_remove_own() {
+    need_root
+    local n="${1:-}" cid="${2:-}" have="" rc=0 e=0
+    inst_name_ok "$n" || die "invalid instance name '$n'"
+    create_id_ok "$cid" || die "invalid creation id '$cid' (want 32 lowercase hex digits)"
+    inst_create_lock
+    if ! inst_exists "$n"; then
+        inst_create_unlock; info "no instance '$n' on this server"; return 4
+    fi
+    have="$(grep -m1 '^CREATE_ID=' "$(inst_conf "$n")" 2>/dev/null | cut -d= -f2)" || true
+    if [[ "$have" != "$cid" ]]; then
+        inst_create_unlock; warn "instance '$n' was not created by this run - left as is"; return 3
+    fi
+    [[ $- == *e* ]] && e=1
+    set +e
+    ( set -e; inst_remove "$n" ); rc=$?
+    [[ $e -eq 1 ]] && set -e
+    if [[ $rc -ne 0 ]] || inst_exists "$n"; then
+        inst_create_unlock; die "could not remove instance '$n'"
+    fi
+    inst_create_unlock
+    return 0
 }
 
 add_parse() {
@@ -1833,6 +1907,27 @@ bench_curl_mbps() {
     [[ -n "$bps" ]] || return 1
     awk -v b="$bps" 'BEGIN{ m=b*8/1000000; if(m<0.05) exit 1; printf "%.3g Mbits/sec", m }'
 }
+bench_create_id() {
+    local f="$ROOT_DIR/bench.id" id=""
+    [[ -r "$f" ]] && id="$(tr -d ' \r\n' < "$f" 2>/dev/null)" || id=""
+    create_id_ok "$id" && { printf '%s' "$id"; return 0; }
+    id="$(new_create_id)" || return 1
+    ( umask 077; printf '%s\n' "$id" > "$f" && chmod 600 "$f" ) 2>/dev/null || true
+    printf '%s' "$id"
+}
+bench_peer_remove() {
+    peer_ssh "$1" "OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh _remove_own '$3' '$2'" >/dev/null 2>&1 || true
+}
+bench_peer_create() {
+    local h="$1" bid="$2" name="$3" a q=""
+    shift 3
+    for a in "$@"; do q+=" '$a'"; done
+    bench_peer_remove "$h" "$bid" "$name"
+    peer_ssh "$h" "OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh _peercreate '$name'$q '$bid'" >/dev/null 2>&1
+}
+bench_far_busy() {
+    echo "FAIL (the foreign would not create '$1': one with that name from another benchmark or an older version is in its way; once no benchmark runs against it, clear it there with: omnitunnel bench-clean)"
+}
 bench_run() {
     need_root; ensure_binary
     local fhost fu fp mylip x
@@ -1920,6 +2015,7 @@ bench_run() {
     hy_target=$(awk -v s="$raw_dl" 'BEGIN{ n=s+0; if (s ~ /Kbits/) n/=1000; else if (s ~ /Gbits/) n*=1000; t=int(n*0.9); if (t<200) t=200; if (t>2000) t=2000; print t }')
     printf "  %bhysteria Brutal-CC target auto-scaled to %s mbps%b\n" "$C_GREY" "$hy_target" "$C_RESET"
 
+    local bid; bid="$(bench_create_id)" || { warn "cannot create the benchmark id in $ROOT_DIR"; return 1; }
     echo; printf "%b\n" "${C_BOLD}Benchmarking each tunnel (a few minutes)...${C_RESET}"
     local rows=() base; base=$(next_subnet_idx); local i=0 t
     # Best-effort measurement: one tunnel failing (a ping with no reply, an iperf
@@ -1934,7 +2030,9 @@ bench_run() {
         echo -n "  $t ... "
         # hysteria has no tun/ping: forward the iperf port through it and measure
         if type_is_hysteria "$t"; then
-            peer_ssh "$fhost" "OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh _peercreate '$name' hysteria server '$fhost' '$mylip' '$port' '$key' '$pa' '$ta' '$hy_target' '$nc'" >/dev/null 2>&1
+            if ! bench_peer_create "$fhost" "$bid" "$name" hysteria server "$fhost" "$mylip" "$port" "$key" "$pa" "$ta" "$hy_target" "$nc" "" "" ""; then
+                rows+=("$t|FAIL|FAIL|100%|n/a"); bench_far_busy "$name"; continue
+            fi
             create_inst "$name" hysteria client "$mylip" "$fhost" "$port" "$key" "$ta" "$pa" "$hy_target" "$nc"
             # download = parallel curl of the foreign's file server (forwarded
             # here on 5598); upload = iperf to the foreign's iperf server through
@@ -1953,7 +2051,7 @@ bench_run() {
             hul=$(timeout 25 iperf3 -c 127.0.0.1 -p 5599 -t 8 -O 2 -P 8 2>/dev/null | grep -oE '[0-9.]+ [KMG]bits/sec +receiver' | tail -1 | awk '{print $1" "$2}')
             rows+=("$t|${hdl:-FAIL}|${hul:-FAIL}|0%|${hrtt:-n/a}"); echo "${hdl:-FAIL} / up ${hul:-FAIL}"
             inst_remove "$name" >/dev/null 2>&1
-            peer_ssh "$fhost" "OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh _remove '$name'" >/dev/null 2>&1 || true
+            bench_peer_remove "$fhost" "$bid" "$name"
             continue
         fi
         # reverse-mux: icmp(reply) tunnel + chisel single-flow MUX. Measured THROUGH
@@ -1962,7 +2060,9 @@ bench_run() {
         # -P 8 parallelism where a raw icmp upload collapses on a policed path.
         if type_is_revmux "$t"; then
             local bport=$((20000 + sub))
-            peer_ssh "$fhost" "OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh _peercreate '$name' reverse-mux server '$fhost' '$mylip' '$port' '' '$pa' '$ta' none '$nc' reply" >/dev/null 2>&1
+            if ! bench_peer_create "$fhost" "$bid" "$name" reverse-mux server "$fhost" "$mylip" "$port" "" "$pa" "$ta" none "$nc" reply "" ""; then
+                rows+=("$t|FAIL|FAIL|100%|n/a"); bench_far_busy "$name"; continue
+            fi
             create_inst "$name" reverse-mux client "$mylip" "$fhost" "$port" "" "$ta" "$pa" none "$nc" reply
             inst_enable "$name" >/dev/null 2>&1; sleep 6
             local rout rloss rrtt
@@ -1979,10 +2079,12 @@ bench_run() {
             rows+=("$t|${rdl:-FAIL}|${rul:-FAIL}|${rloss:-100}%|${rrtt:-n/a}")
             echo "${rdl:-FAIL} / up ${rul:-FAIL} (muxed)"
             inst_remove "$name" >/dev/null 2>&1
-            peer_ssh "$fhost" "OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh mux-off '$name'; OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh _remove '$name'" >/dev/null 2>&1 || true
+            bench_peer_remove "$fhost" "$bid" "$name"
             continue
         fi
-        peer_ssh "$fhost" "OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh _peercreate '$name' '$t' server '$fhost' '$mylip' '$port' '$key' '$pa' '$ta' '$shape' '$nc'" >/dev/null 2>&1
+        if ! bench_peer_create "$fhost" "$bid" "$name" "$t" server "$fhost" "$mylip" "$port" "$key" "$pa" "$ta" "$shape" "$nc" "" "" ""; then
+            rows+=("$t|FAIL|FAIL|100%|n/a"); bench_far_busy "$name"; continue
+        fi
         create_inst "$name" "$t" client "$mylip" "$fhost" "$port" "$key" "$ta" "$pa" "$shape" "$nc"
         inst_enable "$name" >/dev/null 2>&1; sleep 6
         local out loss rtt dl ul
@@ -2000,12 +2102,12 @@ bench_run() {
         rows+=("$t|${dl:-FAIL}|${ul:-FAIL}|${loss:-100}%|${rtt:-n/a}")
         echo "${dl:-FAIL} / up ${ul:-FAIL}"
         inst_remove "$name" >/dev/null 2>&1
-        peer_ssh "$fhost" "OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh _remove '$name'" >/dev/null 2>&1 || true
+        bench_peer_remove "$fhost" "$bid" "$name"
     done
     # belt-and-braces: make sure no bench-* survived on either side
     for t in $ALL_TYPES; do
         inst_exists "bench-$t" && inst_remove "bench-$t" >/dev/null 2>&1 || true
-        peer_ssh "$fhost" "OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh _remove 'bench-$t'" >/dev/null 2>&1 || true
+        bench_peer_remove "$fhost" "$bid" "bench-$t"
     done
     # tear down the foreign measurement helpers (iperf + curl file server)
     peer_ssh "$fhost" "systemctl stop tsbench-iperf tsbench-http 2>/dev/null; pkill -f '[h]ttp.server 5598' 2>/dev/null; rm -f /tmp/omnibench.bin" >/dev/null 2>&1 || true
@@ -2541,6 +2643,7 @@ case "${1:-menu}" in
     enable)           inst_enable "${2:?instance}";;
     remove)           need_root; remove_instance_fully "${2:?instance}";;
     _remove)          need_root; inst_remove "${2:?instance}";;
+    _remove_own)      shift; cmd_remove_own "$@";;
     pf-add)           pf_add "${2:?}" "${3:?}" "${4:?}";;
     pf-del)           pf_del "${2:?}" "${3:?}";;
     mux-add)          shift; cmd_mux_add "$@";;

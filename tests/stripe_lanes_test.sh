@@ -16,8 +16,9 @@ extract() {
     }' "$SCRIPT"
 }
 
-eval "$(extract "type_uses_key type_is_hysteria type_is_stripe type_is_ackless type_is_kernel type_is_revmux tok_re lanes_ok inst_name_ok type_known tok_host_ok tok_ipv4_ok tok_port_ok tok_nc_ok tok_hexkey_ok tok_key_ok tok_shape_ok tok_pmode_ok new_inst_lanes build_execstart load_inst create_inst validate_inst_name list_instances inst_path inst_conf inst_pf inst_exists manual_token cmd_server_token cmd_peercreate provision_peer cmd_add_auto cmd_add_manual add_parse alloc_and_create alloc_subnet alloc_port alloc_port_span next_port next_subnet_idx occupied_port_ranges remote_port_ranges peer_port_triples type_port_span port_base gen_key auto_name")"
+eval "$(extract "type_uses_key type_is_hysteria type_is_stripe type_is_ackless type_is_kernel type_is_revmux tok_re lanes_ok inst_name_ok type_known tok_host_ok tok_ipv4_ok tok_port_ok tok_nc_ok tok_hexkey_ok tok_key_ok tok_shape_ok tok_pmode_ok new_inst_lanes build_execstart load_inst create_inst validate_inst_name list_instances inst_path inst_conf inst_pf inst_exists manual_token cmd_server_token cmd_peercreate provision_peer cmd_add_auto cmd_add_manual add_parse alloc_and_create alloc_subnet alloc_port alloc_port_span next_port next_subnet_idx occupied_port_ranges remote_port_ranges peer_port_triples type_port_span port_base gen_key auto_name create_id_ok new_create_id inst_create_lock inst_create_unlock cmd_remove_own peer_inst_state peer_remove_own")"
 eval "$(grep -m1 '^ALL_TYPES=' "$SCRIPT")"
+eval "$(grep -m1 '^VERSION=' "$SCRIPT")"
 
 fail() { echo "FAIL: $1" >&2; exit 1; }
 die() { echo "DIE: $*" >&2; exit 1; }
@@ -239,6 +240,19 @@ peer_ssh() {
             nm="$(sed -nE "s#.*/etc/omnitunnel/inst/'([^']+)'/instance.conf.*#\1#p" <<< "$*")"
             grep -m1 -E '^LANES=' "$FOREIGN/$nm/instance.conf"
             ;;
+        *" _remove_own "*)
+            if [[ -n "$OLD_FOREIGN" ]]; then echo "usage: omnitunnel.sh"; return 0; fi
+            eval "set -- ${*#* _remove_own }"
+            ( INST_DIR="$FOREIGN"; cmd_remove_own "$@" )
+            ;;
+        *"^CREATE_ID="*)
+            nm="$(sed -nE "s#.*/etc/omnitunnel/inst/'([^']+)'/instance.conf.*#\1#p" <<< "$*")"
+            if [[ -e "$FOREIGN/$nm/instance.conf" ]]; then
+                echo OMNIPRESENT; grep -m1 '^CREATE_ID=' "$FOREIGN/$nm/instance.conf" || true
+            else
+                echo OMNIABSENT
+            fi
+            ;;
         *" _remove "*)
             nm="$(sed -nE "s#.* _remove '([^']+)'.*#\1#p" <<< "$*")"
             rm -rf "${FOREIGN:?}/$nm"
@@ -257,7 +271,7 @@ add_auto_case() {
     : > "$PCALLS"
     ( INST_DIR="$NEAR"; unset OMNITUN_PEER_PASS OMNITUN_PEER_PROXY OMNITUN_ICMP_MODE OMNITUN_ICMP_MODE_PEER; with_lanes_env "$sl"; cmd_add_auto "$t" "$name" 203.0.113.9 16 none 1.2.3.4 ) >/dev/null \
         || fail "add-auto $t $name failed"
-    grep -q " _peercreate '$name' '$t' server .* '' '$want'\$" "$PCALLS" \
+    grep -qE " _peercreate '$name' '$t' server .* '' '$want' '[0-9a-f]{32}'\$" "$PCALLS" \
         || fail "add-auto $t: provision_peer did not pass lane count $want to the foreign's _peercreate: $(grep _peercreate "$PCALLS")"
     [[ "$(conf_lanes "$NEAR" "$name")" == "$want" ]] || fail "add-auto $t: client LANES='$(conf_lanes "$NEAR" "$name")' want $want"
     [[ "$(conf_lanes "$FOREIGN" "$name")" == "$want" ]] || fail "add-auto $t: server LANES='$(conf_lanes "$FOREIGN" "$name")' want $want"
@@ -283,11 +297,14 @@ for v in 0 65 abc; do
 done
 
 OLD_FOREIGN=1
-if ( INST_DIR="$NEAR"; unset STRIPE_LANES; cmd_add_auto stripe stale16 203.0.113.9 16 none 1.2.3.4 ) >/dev/null 2>&1; then
-    fail "add-auto brought up a 16-lane client against a foreign whose manager ignored the lane count"
-fi
+: > "$PCALLS"
+stale_out="$( ( INST_DIR="$NEAR"; unset STRIPE_LANES; cmd_add_auto stripe stale16 203.0.113.9 16 none 1.2.3.4 ) 2>&1 )" \
+    && fail "add-auto brought up a 16-lane client against a foreign whose manager ignored the lane count"
 [[ ! -e "$NEAR/stale16" ]] || fail "add-auto left a 16-lane client behind after the foreign failed to record the lane count"
-[[ ! -e "$FOREIGN/stale16" ]] || fail "add-auto left the mismatched 1-lane server side on the foreign"
+grep -q " _remove_own 'stale16' " "$PCALLS" || fail "add-auto did not try to remove its own mismatched server side"
+! grep -q " _remove 'stale16'" "$PCALLS" || fail "add-auto fell back to the unconditional _remove on a foreign that cannot prove ownership"
+[[ -e "$FOREIGN/stale16/instance.conf" ]] || fail "add-auto removed a foreign instance it could not prove it created"
+[[ "$stale_out" == *"may still exist"* ]] || fail "add-auto must say the mismatched server side may still exist: $stale_out"
 ( INST_DIR="$NEAR"; STRIPE_LANES=1; cmd_add_auto stripe stale1 203.0.113.9 16 none 1.2.3.4 ) >/dev/null \
     || fail "a 1-lane stripe add against a foreign with no LANES line must succeed (both ends run 1 lane)"
 [[ "$(lanes_of "$NEAR" stale1)" == 1 && "$(lanes_of "$FOREIGN" stale1)" == 1 ]] || fail "1-lane add against an old foreign: ends disagree"
@@ -346,4 +363,4 @@ MAINGO="$REPO/src/omnistripe/main.go"
 grep -qE 'flag\.Int\("lanes", 1,' "$MAINGO" \
     || fail "omnistripe's -lanes default must stay 1: units written before 2.9.12 pass no -lanes and must keep matching their peer"
 
-echo "PASSED - stripe runs -lanes \${LANES:-1} with the tuned N/w/to/F, new add-auto/add-manual stripe tunnels get the same lane count on both ends (16 or STRIPE_LANES), a foreign that does not record that lane count is refused and cleaned up, legacy tokens and confs stay at 1 lane, non-stripe tokens and ExecStart lines are unchanged"
+echo "PASSED - stripe runs -lanes \${LANES:-1} with the tuned N/w/to/F, new add-auto/add-manual stripe tunnels get the same lane count on both ends (16 or STRIPE_LANES), a foreign that does not record that lane count is refused and its server side is removed only when this run provably created it, legacy tokens and confs stay at 1 lane, non-stripe tokens and ExecStart lines are unchanged"
