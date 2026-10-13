@@ -27,6 +27,8 @@ SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 ROOT_DIR="/etc/omnitunnel"
 INST_DIR="$ROOT_DIR/inst"
 PEER_DIR="$ROOT_DIR/peers"
+SSH_KH_DIR="$ROOT_DIR/ssh"
+SSH_KNOWN_HOSTS="$SSH_KH_DIR/known_hosts"
 VARLIB_DIR="/var/lib/omnitunnel"
 TSUITE_BIN="${OMNITUN_BIN:-/usr/local/bin/omnitun}"
 BINLINK="/usr/local/bin/omnitunnel"   # the 'omnitunnel' command (symlink to this script)
@@ -1295,12 +1297,64 @@ _peer_creds() {
     [[ -n "$PEER_USER" ]] || PEER_USER=root
     return 0
 }
-# Provisioning SSH: don't let a stale/changed host key block automation
-# (servers get reinstalled and their keys rotate). We authenticate with a
-# password or an ssh key, not TOFU. An optional saved SOCKS5 proxy routes the
-# provisioning SSH/SCP around an ISP that blocks the foreign box's port 22 -
-# this only affects the outbound connection we make, never any server's sshd.
-SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=15 -o ServerAliveInterval=10 -o ServerAliveCountMax=3)
+SSH_OPTS=(-o "UserKnownHostsFile=$SSH_KNOWN_HOSTS" -o CheckHostIP=no -o LogLevel=ERROR -o ConnectTimeout=15 -o ServerAliveInterval=10 -o ServerAliveCountMax=3)
+ssh_kh_init() {
+    if ! ( umask 077
+           mkdir -p "$SSH_KH_DIR" && chmod 700 "$SSH_KH_DIR" &&
+           { [[ -f "$SSH_KNOWN_HOSTS" ]] || : >> "$SSH_KNOWN_HOSTS"; } &&
+           chmod 600 "$SSH_KNOWN_HOSTS" ) 2>/dev/null; then
+        die "cannot prepare the pinned SSH host keys file $SSH_KNOWN_HOSTS"
+    fi
+}
+ssh_accept_new_ok() { ssh -o StrictHostKeyChecking=accept-new -V >/dev/null 2>&1; }
+ssh_kh_name() {
+    local h="$1" p
+    p="$(ssh -G "${SSH_OPTS[@]}" "${PEER_USER:-root}@$h" 2>/dev/null | awk '$1 == "port" && !n { print $2; n = 1 }')" || true
+    if [[ "$p" =~ ^[0-9]+$ && "$p" != 22 ]]; then printf '[%s]:%s\n' "$h" "$p"; else printf '%s\n' "$h"; fi
+}
+_hostkey_opts() {
+    if ssh_accept_new_ok; then
+        HOSTKEY_OPTS=(-o StrictHostKeyChecking=accept-new)
+    elif ssh-keygen -F "$(ssh_kh_name "$1")" -f "$SSH_KNOWN_HOSTS" >/dev/null 2>&1; then
+        HOSTKEY_OPTS=(-o StrictHostKeyChecking=yes)
+    else
+        HOSTKEY_OPTS=(-o StrictHostKeyChecking=no)
+    fi
+}
+hostkey_abort() {
+    local h="$1" log="${2:-}" out="" port="" rest fp kt
+    if [[ -n "$log" && -f "$log" ]]; then out="$(cat "$log" 2>/dev/null)"; rm -f "$log"; fi
+    if [[ "$out" == *"[$h]:"* ]]; then rest="${out#*"[$h]:"}"; port="${rest%%[!0-9]*}"; fi
+    fp="$(printf '%s\n' "$out" | grep -oE 'SHA256:[A-Za-z0-9+/]+' | head -n1)" || true
+    kt="$(printf '%s\n' "$out" | sed -n 's/.*fingerprint for the \([A-Za-z0-9-]*\) key sent.*/\1/p' | head -n1)" || true
+    kt="${kt,,}"
+    {
+        printf '%b✗%b SSH host key check FAILED for the foreign %s%s\n' "$C_BRED$C_BOLD" "$C_RESET" "$h" "${port:+ (port $port)}"
+        printf '  Its key does not match the one OmniTunnel pinned in %s.\n' "$SSH_KNOWN_HOSTS"
+        if [[ "$out" == *"Host key verification failed"* ]]; then
+            printf '  ssh refused before logging in: no password and no command reached it. OmniTunnel stopped here.\n'
+        else
+            printf '  This ssh (older than OpenSSH 7.6) warned but went on with key login, so the last command may have reached it. OmniTunnel stopped here.\n'
+        fi
+        printf '  A reinstalled server has a new key; so does a man-in-the-middle.\n'
+        [[ -z "$fp" ]] || printf '  It now presents the %s key %s\n' "${kt:-host}" "$fp"
+        printf '  On the foreign'"'"'s own console compare:  ssh-keygen -lf /etc/ssh/ssh_host_%s_key.pub\n' "${kt:-ed25519}"
+        printf '  Only if they match, run:  %bomnitunnel forget-host %s%s%b  then retry.\n' "$C_CYAN" "$h" "${port:+ $port}" "$C_RESET"
+    } >&"${OMNI_ERR_FD:-2}"
+    exit 1
+}
+_peer_run() {
+    local h="$1" log rc=0; shift
+    log="$(mktemp "${TMPDIR:-/tmp}/omnitunnel-ssh.XXXXXX" 2>/dev/null)" || log=""
+    if [[ -z "$log" ]]; then "$@" || rc=$?; return "$rc"; fi
+    { "$@" 2>&1 1>&3 3>&- | tee "$log" >&2 3>&-; rc=${PIPESTATUS[0]}; } 3>&1 || true
+    if grep -qF 'REMOTE HOST IDENTIFICATION HAS CHANGED' "$log" ||
+       { [[ $rc -ne 0 ]] && grep -qF 'Host key verification failed' "$log"; }; then
+        hostkey_abort "$h" "$log"
+    fi
+    rm -f "$log"
+    return "$rc"
+}
 _proxy_opts() { PROXY_OPTS=(); [[ -n "${PEER_PROXY:-}" ]] || return 0
     # Route ONLY the control SSH/SCP to the foreign through a SOCKS5 proxy (for
     # DPI-blocked Iran<->foreign paths). The tunnel data never touches the proxy.
@@ -1313,15 +1367,42 @@ _proxy_opts() { PROXY_OPTS=(); [[ -n "${PEER_PROXY:-}" ]] || return 0
         PROXY_OPTS=(-o "ProxyCommand=nc -X 5 -x $PEER_PROXY %h %p")
     fi
     return 0; }
-peer_ssh() { local h="$1"; shift; _peer_creds "$h"; _proxy_opts
+peer_ssh() { local h="$1"; shift; ssh_kh_init; _peer_creds "$h"; _proxy_opts; _hostkey_opts "$h"
     if [[ -n "$PEER_PASS" ]] && command -v sshpass >/dev/null; then
-        sshpass -p "$PEER_PASS" ssh "${SSH_OPTS[@]}" ${PROXY_OPTS[@]+"${PROXY_OPTS[@]}"} "$PEER_USER@$h" "$@"
-    else ssh "${SSH_OPTS[@]}" ${PROXY_OPTS[@]+"${PROXY_OPTS[@]}"} "$PEER_USER@$h" "$@"; fi
+        _peer_run "$h" sshpass -p "$PEER_PASS" ssh "${SSH_OPTS[@]}" "${HOSTKEY_OPTS[@]}" ${PROXY_OPTS[@]+"${PROXY_OPTS[@]}"} "$PEER_USER@$h" "$@"
+    else _peer_run "$h" ssh "${SSH_OPTS[@]}" "${HOSTKEY_OPTS[@]}" ${PROXY_OPTS[@]+"${PROXY_OPTS[@]}"} "$PEER_USER@$h" "$@"; fi
 }
-peer_scp() { local h="$1" s="$2" d="$3"; _peer_creds "$h"; _proxy_opts
+peer_scp() { local h="$1" s="$2" d="$3" th="$1"; ssh_kh_init; _peer_creds "$h"; _proxy_opts; _hostkey_opts "$h"
+    case "$h" in *:*) th="[$h]";; esac
     if [[ -n "$PEER_PASS" ]] && command -v sshpass >/dev/null; then
-        sshpass -p "$PEER_PASS" scp "${SSH_OPTS[@]}" ${PROXY_OPTS[@]+"${PROXY_OPTS[@]}"} "$s" "$PEER_USER@$h:$d"
-    else scp "${SSH_OPTS[@]}" ${PROXY_OPTS[@]+"${PROXY_OPTS[@]}"} "$s" "$PEER_USER@$h:$d"; fi
+        _peer_run "$h" sshpass -p "$PEER_PASS" scp "${SSH_OPTS[@]}" "${HOSTKEY_OPTS[@]}" ${PROXY_OPTS[@]+"${PROXY_OPTS[@]}"} "$s" "$PEER_USER@$th:$d"
+    else _peer_run "$h" scp "${SSH_OPTS[@]}" "${HOSTKEY_OPTS[@]}" ${PROXY_OPTS[@]+"${PROXY_OPTS[@]}"} "$s" "$PEER_USER@$th:$d"; fi
+}
+cmd_forget_host() {
+    need_root
+    local h="${1:-}" p="${2:-}" re='^\[([^]]+)\]:([0-9]+)$' n hit=0
+    local names=()
+    if [[ -z "$p" && "$h" =~ $re ]]; then h="${BASH_REMATCH[1]}"; p="${BASH_REMATCH[2]}"; fi
+    tok_host_ok "$h" || die "usage: forget-host <host> [port]   (the foreign IP or name, as OmniTunnel connects to it)"
+    [[ -z "$p" ]] || tok_port_ok "$p" || die "invalid SSH port '$p' (want 1-65535)"
+    [[ -f "$SSH_KNOWN_HOSTS" ]] || { info "no SSH host keys are pinned yet ($SSH_KNOWN_HOSTS)"; return 0; }
+    names=("$h")
+    if [[ -n "$p" ]]; then
+        [[ "$p" == 22 ]] || names+=("[$h]:$p")
+    else
+        n="$(ssh_kh_name "$h")"; [[ "$n" == "$h" ]] || names+=("$n")
+    fi
+    for n in "${names[@]}"; do
+        ssh-keygen -F "$n" -f "$SSH_KNOWN_HOSTS" >/dev/null 2>&1 || continue
+        ssh-keygen -R "$n" -f "$SSH_KNOWN_HOSTS" >/dev/null 2>&1 || die "could not remove the pinned key for $n from $SSH_KNOWN_HOSTS"
+        chmod 600 "$SSH_KNOWN_HOSTS" 2>/dev/null || true
+        ok "forgot the pinned SSH host key for $n"; hit=1
+    done
+    if [[ "$hit" == 1 ]]; then
+        info "the next SSH connection to $h pins whatever key it presents - check it is the real server"
+    else
+        info "no pinned SSH host key for $h${p:+ port $p} in $SSH_KNOWN_HOSTS"
+    fi
 }
 
 # dotted-version compare: succeeds (0) only if $1 is strictly newer than $2
@@ -1340,7 +1421,9 @@ guard_peer_downgrade() {
     # has no manager yet (the normal first-time case) the remote grep exits
     # non-zero, pipefail propagates it to the assignment, and set -e would abort
     # the WHOLE add/bench silently right after the "This box public IP" prompt.
-    pver=$(peer_ssh "$h" "grep -m1 -oE 'VERSION=\"[0-9.]+\"' /opt/omnitunnel/omnitunnel.sh 2>/dev/null | grep -oE '[0-9.]+'" 2>/dev/null | tr -d '\r\n ') || true
+    local vf; vf="$(mktemp 2>/dev/null)" || die "cannot create a temp file for the foreign version check"
+    peer_ssh "$h" "grep -m1 -oE 'VERSION=\"[0-9.]+\"' /opt/omnitunnel/omnitunnel.sh 2>/dev/null | grep -oE '[0-9.]+'" >"$vf" 2>/dev/null </dev/null || true
+    pver="$(tr -d '\r\n ' < "$vf")"; rm -f "$vf"
     [[ -n "$pver" ]] || return 0                 # foreign has no OmniTunnel yet - just provision it
     ver_gt "$pver" "$VERSION" || return 0         # we are same-or-newer: safe to push
     warn "The foreign $h runs v$pver but this box is older (v$VERSION)."
@@ -2305,9 +2388,10 @@ menu_instances() {
         nitem 3 "Remove a tunnel"                                     "$C_BRED$C_BOLD"
         nitem 4 "Restart a tunnel"
         nitem 5 "Live logs"
+        nitem 6 "Forget a foreign's SSH host key  (after that server was reinstalled)"
         nitem 0 "Back"
         rule_green
-        printf '  %bEnter your choice [0-5]:%b ' "$C_BGRN" "$C_RESET"
+        printf '  %bEnter your choice [0-6]:%b ' "$C_BGRN" "$C_RESET"
         read -r c || exit 0
         case "$c" in
             1) wizard_add; pause;;
@@ -2315,6 +2399,8 @@ menu_instances() {
             3) if pick_instance; then remove_instance_fully "$PICK"; fi; pause;;
             4) if pick_instance; then inst_enable "$PICK"; fi; pause;;
             5) if pick_instance; then journalctl -u "$(svc_name "$PICK")" -n 40 --no-pager 2>/dev/null || true; fi; pause;;
+            6) local fh fpo; read -erp "  Foreign server IP or name: " fh; read -erp "  Its SSH port [22]: " fpo
+               if [[ -n "$fh" ]]; then ( cmd_forget_host "$fh" "${fpo:-}" ) || true; fi; pause;;
             0) return;;
         esac
     done
@@ -2402,6 +2488,7 @@ mkdir -p "$INST_DIR" "$PEER_DIR" 2>/dev/null || true
 # remember how we were invoked so guard_peer_downgrade can re-exec after a
 # self-update (see that function).
 OMNI_ARGV=("$@")
+exec {OMNI_ERR_FD}>&2 || OMNI_ERR_FD=2
 case "${1:-menu}" in
     menu|"")          need_root; ensure_binary; menu_main;;
     bench)            need_root; bench_run;;
@@ -2426,6 +2513,7 @@ case "${1:-menu}" in
     _postup)          cmd_postup "${2:?}";;
     _prefwd)          cmd_prefwd;;
     _peercreate)      shift; cmd_peercreate "$@";;
+    forget-host)      need_root; cmd_forget_host "${2:-}" "${3:-}";;
     ensure-binary)    ensure_binary; ok "core ready at $TSUITE_BIN ($(arch_tag))";;
     fix-forwarding)   need_root; ensure_forwarding ""
                       for n in $(list_instances); do
@@ -2446,5 +2534,5 @@ case "${1:-menu}" in
     update|upgrade)   need_root; cmd_update;;
     uninstall|purge)  need_root; cmd_uninstall;;
     version|-v|--version) echo "tunnelctl $VERSION (core: $($TSUITE_BIN version 2>/dev/null || echo n/a))";;
-    *) echo "usage: $0 [menu|bench|add|list|status <n>|enable <n>|remove <n>|pf-add <n> <proto> <port>|pf-del <n> <port>|mux-add <n> <pubport> <dsthost> <dstport>|mux-del <n> <pubport>|mux-token <tok>|fix-forwarding|update|uninstall]";;
+    *) echo "usage: $0 [menu|bench|add|list|status <n>|enable <n>|remove <n>|pf-add <n> <proto> <port>|pf-del <n> <port>|mux-add <n> <pubport> <dsthost> <dstport>|mux-del <n> <pubport>|mux-token <tok>|forget-host <host> [port]|fix-forwarding|update|uninstall]";;
 esac

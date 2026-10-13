@@ -94,6 +94,15 @@ jobs:
             bash "$t"
             echo "::endgroup::"
           done
+      - name: SSH host-key pinning test (root, real sshd)
+        run: |
+          set -eo pipefail
+          if [ ! -x /usr/sbin/sshd ] || ! command -v sshpass >/dev/null; then
+            sudo apt-get update -qq
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq openssh-server sshpass
+          fi
+          sudo bash tests/ssh_hostkey_test.sh | tee /tmp/ssh_hostkey_test.out
+          grep -q '^PASSED - ssh_hostkey_test' /tmp/ssh_hostkey_test.out
 
   direct-c:
     name: C core (${{ matrix.os }})

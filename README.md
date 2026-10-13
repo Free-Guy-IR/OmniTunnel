@@ -278,6 +278,33 @@ original icmptun did) — save a peer with a proxy and the manager adds
 > The tunnel always uses **its own port** (e.g. 51820), never 22. Installing or
 > running OmniTunnel never changes any server's SSH login or SSH port.
 
+### Foreign SSH host keys are pinned
+
+The auto setup, the SSH benchmark and `remove` reach the foreign server over
+SSH/SCP. OmniTunnel keeps its own `known_hosts` for that at
+`/etc/omnitunnel/ssh/known_hosts` (root only, mode 0600). The first connection to
+a foreign records its host key; every later connection, direct or through the
+SOCKS5 proxy, must present the same key. If the key changes, ssh refuses before
+logging in, so neither the saved password nor any command reaches that server,
+and OmniTunnel stops with a message that names the server and shows the
+fingerprint it now presents.
+
+A reinstalled server legitimately gets a new key. Compare that fingerprint with
+the one on the server's own console (`ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`)
+and, only if they match, forget the old key (CLI below, or *Manage tunnels → 6*)
+and retry. Add the SSH port when the foreign's SSH does not listen on 22:
+
+```bash
+omnitunnel forget-host 1.2.3.4
+omnitunnel forget-host 1.2.3.4 2222
+```
+
+The next connection pins whatever key the server then presents. With OpenSSH
+older than 7.6 (no `accept-new`), an unknown server is recorded on first contact
+and a pinned one is checked strictly, so a changed key is refused the same way.
+After upgrading from an older OmniTunnel, the first connection to each existing
+foreign pins its current key.
+
 ---
 
 ## Topologies (many-to-many)
@@ -320,6 +347,7 @@ omnitunnel list
 omnitunnel status  <instance>
 omnitunnel remove  <instance>        # removes ONLY that instance (both-side safe)
 omnitunnel pf-add  <instance> <tcp|udp|both> <port>
+omnitunnel forget-host <foreign_ip> [ssh_port]
 omnitunnel bench
 omnitunnel update                    # pull the latest from GitHub (see below)
 omnitunnel uninstall                 # remove every tunnel + all files, incl. itself
