@@ -101,6 +101,7 @@ jobs:
             sudo apt-get update -qq
             sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq openssh-server sshpass
           fi
+          sudo mkdir -p /run/sshd
           sudo bash tests/ssh_hostkey_test.sh | tee /tmp/ssh_hostkey_test.out
           grep -q '^PASSED - ssh_hostkey_test' /tmp/ssh_hostkey_test.out
 
