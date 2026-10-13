@@ -104,6 +104,15 @@ jobs:
           sudo mkdir -p /run/sshd
           sudo bash tests/ssh_hostkey_test.sh | tee /tmp/ssh_hostkey_test.out
           grep -q '^PASSED - ssh_hostkey_test' /tmp/ssh_hostkey_test.out
+      - name: nft teardown cleanup test (root, private netns)
+        run: |
+          set -eo pipefail
+          if ! command -v nft >/dev/null; then
+            sudo apt-get update -qq
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nftables
+          fi
+          sudo bash tests/remove_nft_cleanup_test.sh | tee /tmp/remove_nft_cleanup_test.out
+          grep -q '^PASSED - .* remove/nft cleanup cases' /tmp/remove_nft_cleanup_test.out
 
   direct-c:
     name: C core (${{ matrix.os }})

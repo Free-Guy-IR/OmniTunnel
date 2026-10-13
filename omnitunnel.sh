@@ -710,7 +710,9 @@ apply_tuning() {
 with_mangle_lock() {
     local fd rc=0
     mkdir -p "$RUN_DIR" 2>/dev/null || return 1
+    chmod 700 "$RUN_DIR" 2>/dev/null || true
     exec {fd}>>"$RUN_DIR/mangle.lock" || return 1
+    chmod 600 "$RUN_DIR/mangle.lock" 2>/dev/null || true
     if flock -w 15 "$fd"; then "$@" || rc=$?; else rc=1; fi
     exec {fd}>&-
     return "$rc"
@@ -761,6 +763,7 @@ mss_clamp_add() {
     read -r k th u <<< "$after" || true
     if [[ -z "$before" ]]; then
         printf 'table %s\n' "$th" > "$f" 2>/dev/null || true
+        chmod 600 "$f" 2>/dev/null || true
         return 0
     fi
     read -r k tb u <<< "$before" || true
@@ -770,6 +773,7 @@ mss_clamp_add() {
         grep -q "^chain $n " <<< "$before" && continue
         printf 'chain %s %s %s\n' "$th" "$n" "$h" >> "$f" 2>/dev/null || true
     done <<< "$after"
+    if [[ -e "$f" ]]; then chmod 600 "$f" 2>/dev/null || true; fi
     return 0
 }
 mangle_release() {
@@ -796,7 +800,7 @@ mangle_release() {
                 keep+="chain $a $b $c"$'\n';;
         esac
     done <<< "$recs"
-    if [[ -n "$keep" ]]; then printf '%s' "$keep" > "$f"; else rm -f "$f"; fi
+    if [[ -n "$keep" ]]; then printf '%s' "$keep" > "$f"; chmod 600 "$f" 2>/dev/null || true; else rm -f "$f"; fi
     return 0
 }
 
@@ -1438,8 +1442,9 @@ ssh_kh_init() {
 }
 ssh_accept_new_ok() { ssh -o StrictHostKeyChecking=accept-new -V >/dev/null 2>&1; }
 ssh_kh_name() {
-    local h="$1" p
-    p="$(ssh -G "${SSH_OPTS[@]}" "${PEER_USER:-root}@$h" 2>/dev/null | awk '$1 == "port" && !n { print $2; n = 1 }')" || true
+    local h="$1" g p
+    g="$(ssh -G "${SSH_OPTS[@]}" "${PEER_USER:-root}@$h" 2>/dev/null)" || return 2
+    p="$(printf '%s\n' "$g" | awk '$1 == "port" && !n { print $2; n = 1 }')"
     if [[ "$p" =~ ^[0-9]+$ && "$p" != 22 ]]; then printf '[%s]:%s\n' "$h" "$p"; else printf '%s\n' "$h"; fi
 }
 _hostkey_unlock() {
@@ -1453,7 +1458,7 @@ _hostkey_opts() {
     HOSTKEY_LOCK_FD=""
     if ssh_accept_new_ok; then HOSTKEY_OPTS=(-o StrictHostKeyChecking=accept-new); return 0; fi
     HOSTKEY_OPTS=(-o StrictHostKeyChecking=yes)
-    kh="$(ssh_kh_name "$1")"
+    kh="$(ssh_kh_name "$1")" || die_loud "cannot resolve the SSH host-key name for $1 ('ssh -G' failed) - refusing to connect to an unverified target"
     ssh-keygen -F "$kh" -f "$SSH_KNOWN_HOSTS" >/dev/null 2>&1 && return 0
     { exec {fd}>"$lock"; } 2>/dev/null ||
         die_loud "cannot open the SSH first-contact lock $lock - not connecting to $1, whose key is not pinned yet (this ssh is older than OpenSSH 7.6)"
@@ -1494,8 +1499,8 @@ _peer_run() {
     if [[ -z "$log" ]]; then "$@" || rc=$?; _hostkey_unlock; return "$rc"; fi
     tmp_track "$log"
     { "$@" 2>&1 1>&3 3>&- | tee "$log" >&2 3>&-; rc=${PIPESTATUS[0]}; } 3>&1 || true
-    if grep -qF 'REMOTE HOST IDENTIFICATION HAS CHANGED' "$log" ||
-       { [[ $rc -ne 0 ]] && grep -qF 'Host key verification failed' "$log"; }; then
+    if grep -qF 'WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!' "$log" ||
+       { [[ $rc -ne 0 ]] && grep -qxF 'Host key verification failed.' "$log"; }; then
         hostkey_abort "$h" "$log"
     fi
     tmp_cleanup "$log"
@@ -1537,7 +1542,7 @@ cmd_forget_host() {
         names=("[$h]:$p")
     else
         names=("$h")
-        if [[ -z "$p" ]]; then n="$(ssh_kh_name "$h")"; [[ "$n" == "$h" ]] || names+=("$n"); fi
+        if [[ -z "$p" ]]; then n="$(ssh_kh_name "$h")" || die "cannot resolve the SSH host-key name for $h ('ssh -G' failed)"; [[ "$n" == "$h" ]] || names+=("$n"); fi
     fi
     for n in "${names[@]}"; do
         ssh-keygen -F "$n" -f "$SSH_KNOWN_HOSTS" >/dev/null 2>&1 || continue
