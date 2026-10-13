@@ -207,6 +207,25 @@ case_regrace() {
     echo "regrace: $N adds overlapped $DELS dels, none lost"
 }
 
+case_donekeep() {
+    local R F
+    R="$WORK/dk.r"; F="$WORK/dk.f"; mkdir -p "$R" "$F"
+    ( ROOT_DIR="$R"; bench_reg_add "$AB" "$HX" )
+    seed_inst "$F" "$AB" bench-udp || fail "donekeep: could not seed the run's own instance"
+    ( ROOT_DIR="$R"; FOREIGN="$F"; FAIL_REMOVE="$HX"; BENCH_ID="$AB"; BENCH_LOCK_FD=""; bench_run_done "$HX" )
+    reg_has "$AB" "$R/bench.ids" || fail "donekeep: bench_run_done dropped the run's own id although its foreign bench-* removal failed"
+    [[ -e "$F/bench-udp/instance.conf" ]] || fail "donekeep: the foreign instance vanished although its removal was supposed to fail"
+}
+
+case_addfail() {
+    local R out rc=0
+    R="$WORK/af.r"; mkdir -p "$R"
+    mkdir -p "$R/bench.ids"
+    out="$( ROOT_DIR="$R"; BENCH_ID=""; bench_create_id "$HX" 2>/dev/null )" || rc=$?
+    [[ $rc -ne 0 ]] || fail "addfail: bench_create_id returned success although the registry entry could not be written (a benchmark would proceed unregistered)"
+    [[ -z "$out" ]] || fail "addfail: bench_create_id printed a usable id ('$out') although the registry write failed"
+}
+
 RESULTS=(); BAD=0
 run_case() {
     local id="$1" out rc=0
@@ -215,7 +234,7 @@ run_case() {
     else RESULTS+=("FAIL ($id): $(grep -m1 '^FAIL' <<<"$out" || tail -n1 <<<"$out")"); BAD=1; fi
 }
 
-for c in interleave unit crash live empty crosshost failremove legacy regrace; do run_case "$c"; done
+for c in interleave unit crash live empty crosshost failremove legacy regrace donekeep addfail; do run_case "$c"; done
 printf '%s\n' "${RESULTS[@]}"
 [[ $BAD -eq 0 ]] || { echo "bench_runid_test FAILED" >&2; exit 1; }
 echo "PASSED - distinct per-run benchmark ids ($ITER concurrent pairs never cross-remove), host-tagged registry with flock liveness: an abandoned id is dropped only after a CONFIRMED same-host removal, kept when the host differs (crosshost) or the removal fails (failremove), a live concurrent run is untouched, and a legacy 2.9.12 bench.id is migrated and cleaned"

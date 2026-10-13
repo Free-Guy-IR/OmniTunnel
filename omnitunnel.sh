@@ -2052,12 +2052,14 @@ bench_reg_file() { echo "$ROOT_DIR/bench.ids"; }
 bench_reg_lock() { echo "$ROOT_DIR/.bench.ids.lock"; }
 bench_id_lock() { echo "$ROOT_DIR/bench.$1.lock"; }
 bench_reg_add() {
-    local id="$1" host="${2:-}"
-    mkdir -p "$ROOT_DIR" 2>/dev/null || true
+    local id="$1" host="${2:-}" reg
+    mkdir -p "$ROOT_DIR" 2>/dev/null || return 1
+    reg="$(bench_reg_file)"
     (
         if exec {afd}>"$(bench_reg_lock)" 2>/dev/null; then flock "$afd" 2>/dev/null || true; fi
-        umask 077; printf '%s %s\n' "$id" "$host" >> "$(bench_reg_file)" && chmod 600 "$(bench_reg_file)"
+        umask 077; printf '%s %s\n' "$id" "$host" >> "$reg" && chmod 600 "$reg"
     ) 2>/dev/null || true
+    grep -qE "^$id( |$)" "$reg" 2>/dev/null
 }
 bench_reg_del() {
     local id="$1" reg tmp
@@ -2078,7 +2080,12 @@ bench_create_id() {
     mkdir -p "$ROOT_DIR" 2>/dev/null || true
     BENCH_ID="$id"
     if exec {BENCH_LOCK_FD}>"$(bench_id_lock "$id")" 2>/dev/null; then flock "$BENCH_LOCK_FD" 2>/dev/null || true; fi
-    bench_reg_add "$id" "$host"
+    if ! bench_reg_add "$id" "$host"; then
+        if [[ -n "${BENCH_LOCK_FD:-}" ]]; then flock -u "$BENCH_LOCK_FD" 2>/dev/null || true; exec {BENCH_LOCK_FD}>&- 2>/dev/null || true; BENCH_LOCK_FD=""; fi
+        rm -f "$(bench_id_lock "$id")" 2>/dev/null || true
+        BENCH_ID=""
+        return 1
+    fi
     printf '%s' "$id"
 }
 bench_abandoned_ids() {
@@ -2120,12 +2127,21 @@ bench_clean_abandoned() {
     done
 }
 bench_run_done() {
+    local h="${1:-}" t ok=1
+    if [[ -n "${BENCH_ID:-}" ]]; then
+        if [[ -n "$h" ]]; then
+            for t in $ALL_TYPES; do bench_peer_remove_confirm "$h" "$BENCH_ID" "bench-$t" || ok=0; done
+        else
+            ok=0
+        fi
+    fi
     if [[ -n "${BENCH_LOCK_FD:-}" ]]; then
         flock -u "$BENCH_LOCK_FD" 2>/dev/null || true
         exec {BENCH_LOCK_FD}>&- 2>/dev/null || true
         BENCH_LOCK_FD=""
     fi
-    [[ -n "${BENCH_ID:-}" ]] && { bench_reg_del "$BENCH_ID"; BENCH_ID=""; }
+    [[ -n "${BENCH_ID:-}" && "$ok" == 1 ]] && bench_reg_del "$BENCH_ID"
+    BENCH_ID=""
     return 0
 }
 bench_peer_remove() {
@@ -2327,7 +2343,7 @@ bench_run() {
     # tear down the foreign measurement helpers (iperf + curl file server)
     peer_ssh "$fhost" "systemctl stop tsbench-iperf tsbench-http 2>/dev/null; pkill -f '[h]ttp.server 5598' 2>/dev/null; rm -f /tmp/omnibench.bin" >/dev/null 2>&1 || true
     set -e
-    bench_run_done
+    bench_run_done "$fhost"
 
     ROWS=("${rows[@]}"); RAW_DL="${raw_dl:-n/a}"; RAW_UL="${raw_ul:-n/a}"; RAW_PING="${raw_ping:-n/a}"; bench_table
     printf '  %bevery test tunnel was removed from both sides.%b\n\n' "$C_GREY" "$C_RESET"
