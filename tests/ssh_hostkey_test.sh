@@ -42,7 +42,7 @@ VERSION="0.0.1"
 mkdir -p "$INST_DIR" "$PEER_DIR"
 eval "$(grep -E '^[CG]_[A-Z_]+=' "$SCRIPT")"
 eval "$(grep -E '^(SSH_KH_DIR|SSH_KNOWN_HOSTS|SSH_OPTS)=' "$SCRIPT")"
-eval "$(extract "need_root die ok info warn tok_re tok_host_ok tok_port_ok peer_conf save_peer _peer_creds _proxy_opts peer_ssh peer_scp ssh_kh_init ssh_accept_new_ok ssh_kh_name _hostkey_opts _peer_run hostkey_abort cmd_forget_host ver_gt guard_peer_downgrade")"
+eval "$(extract "need_root die ok info warn tok_re tok_host_ok tok_port_ok peer_conf save_peer _peer_creds _proxy_opts peer_ssh peer_scp ssh_kh_init ssh_accept_new_ok ssh_kh_name _hostkey_opts _hostkey_unlock die_loud tmp_track tmp_cleanup _peer_run hostkey_abort cmd_forget_host ver_gt guard_peer_downgrade")"
 cmd_update() { touch "$D/update_called"; return 1; }
 KH="${SSH_KNOWN_HOSTS:-$ROOT_DIR/ssh/known_hosts}"
 

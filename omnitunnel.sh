@@ -1300,12 +1300,27 @@ _peer_creds() {
     return 0
 }
 SSH_OPTS=(-o "UserKnownHostsFile=$SSH_KNOWN_HOSTS" -o CheckHostIP=no -o LogLevel=ERROR -o ConnectTimeout=15 -o ServerAliveInterval=10 -o ServerAliveCountMax=3)
+SSH_KH_LOCK_WAIT=120
+OMNI_TMP_FILES=()
+tmp_track() { OMNI_TMP_FILES+=("$1"); }
+tmp_cleanup() {
+    local f keep=()
+    for f in ${OMNI_TMP_FILES[@]+"${OMNI_TMP_FILES[@]}"}; do
+        if [[ -z "${1:-}" || "$f" == "$1" ]]; then rm -f -- "$f"; else keep+=("$f"); fi
+    done
+    OMNI_TMP_FILES=(${keep[@]+"${keep[@]}"})
+}
+die_loud() {
+    tmp_cleanup
+    printf '%b✗%b %s\n' "$C_BRED$C_BOLD" "$C_RESET" "$*" >&"${OMNI_ERR_FD:-2}"
+    exit 1
+}
 ssh_kh_init() {
     if ! ( umask 077
            mkdir -p "$SSH_KH_DIR" && chmod 700 "$SSH_KH_DIR" &&
            { [[ -f "$SSH_KNOWN_HOSTS" ]] || : >> "$SSH_KNOWN_HOSTS"; } &&
            chmod 600 "$SSH_KNOWN_HOSTS" ) 2>/dev/null; then
-        die "cannot prepare the pinned SSH host keys file $SSH_KNOWN_HOSTS"
+        die_loud "cannot prepare the pinned SSH host keys file $SSH_KNOWN_HOSTS"
     fi
 }
 ssh_accept_new_ok() { ssh -o StrictHostKeyChecking=accept-new -V >/dev/null 2>&1; }
@@ -1314,14 +1329,28 @@ ssh_kh_name() {
     p="$(ssh -G "${SSH_OPTS[@]}" "${PEER_USER:-root}@$h" 2>/dev/null | awk '$1 == "port" && !n { print $2; n = 1 }')" || true
     if [[ "$p" =~ ^[0-9]+$ && "$p" != 22 ]]; then printf '[%s]:%s\n' "$h" "$p"; else printf '%s\n' "$h"; fi
 }
+_hostkey_unlock() {
+    [[ -n "${HOSTKEY_LOCK_FD:-}" ]] || return 0
+    flock -u "$HOSTKEY_LOCK_FD" 2>/dev/null || true
+    exec {HOSTKEY_LOCK_FD}>&-
+    HOSTKEY_LOCK_FD=""
+}
 _hostkey_opts() {
-    if ssh_accept_new_ok; then
-        HOSTKEY_OPTS=(-o StrictHostKeyChecking=accept-new)
-    elif ssh-keygen -F "$(ssh_kh_name "$1")" -f "$SSH_KNOWN_HOSTS" >/dev/null 2>&1; then
-        HOSTKEY_OPTS=(-o StrictHostKeyChecking=yes)
-    else
-        HOSTKEY_OPTS=(-o StrictHostKeyChecking=no)
+    local kh fd lock="$SSH_KH_DIR/.first-contact.lock" w="${SSH_KH_LOCK_WAIT:-120}"
+    HOSTKEY_LOCK_FD=""
+    if ssh_accept_new_ok; then HOSTKEY_OPTS=(-o StrictHostKeyChecking=accept-new); return 0; fi
+    HOSTKEY_OPTS=(-o StrictHostKeyChecking=yes)
+    kh="$(ssh_kh_name "$1")"
+    ssh-keygen -F "$kh" -f "$SSH_KNOWN_HOSTS" >/dev/null 2>&1 && return 0
+    { exec {fd}>"$lock"; } 2>/dev/null ||
+        die_loud "cannot open the SSH first-contact lock $lock - not connecting to $1, whose key is not pinned yet (this ssh is older than OpenSSH 7.6)"
+    if ! flock -w "$w" "$fd" 2>/dev/null; then
+        exec {fd}>&-
+        die_loud "could not take the SSH first-contact lock $lock within ${w}s (another OmniTunnel run is contacting a new foreign) - not connecting to $1; retry"
     fi
+    if ssh-keygen -F "$kh" -f "$SSH_KNOWN_HOSTS" >/dev/null 2>&1; then exec {fd}>&-; return 0; fi
+    HOSTKEY_OPTS=(-o StrictHostKeyChecking=no)
+    HOSTKEY_LOCK_FD="$fd"
 }
 hostkey_abort() {
     local h="$1" log="${2:-}" out="" port="" rest fp kt
@@ -1343,18 +1372,21 @@ hostkey_abort() {
         printf '  On the foreign'"'"'s own console compare:  ssh-keygen -lf /etc/ssh/ssh_host_%s_key.pub\n' "${kt:-ed25519}"
         printf '  Only if they match, run:  %bomnitunnel forget-host %s%s%b  then retry.\n' "$C_CYAN" "$h" "${port:+ $port}" "$C_RESET"
     } >&"${OMNI_ERR_FD:-2}"
+    tmp_cleanup
     exit 1
 }
 _peer_run() {
     local h="$1" log rc=0; shift
     log="$(mktemp "${TMPDIR:-/tmp}/omnitunnel-ssh.XXXXXX" 2>/dev/null)" || log=""
-    if [[ -z "$log" ]]; then "$@" || rc=$?; return "$rc"; fi
+    if [[ -z "$log" ]]; then "$@" || rc=$?; _hostkey_unlock; return "$rc"; fi
+    tmp_track "$log"
     { "$@" 2>&1 1>&3 3>&- | tee "$log" >&2 3>&-; rc=${PIPESTATUS[0]}; } 3>&1 || true
     if grep -qF 'REMOTE HOST IDENTIFICATION HAS CHANGED' "$log" ||
        { [[ $rc -ne 0 ]] && grep -qF 'Host key verification failed' "$log"; }; then
         hostkey_abort "$h" "$log"
     fi
-    rm -f "$log"
+    tmp_cleanup "$log"
+    _hostkey_unlock
     return "$rc"
 }
 _proxy_opts() { PROXY_OPTS=(); [[ -n "${PEER_PROXY:-}" ]] || return 0
@@ -1388,11 +1420,11 @@ cmd_forget_host() {
     tok_host_ok "$h" || die "usage: forget-host <host> [port]   (the foreign IP or name, as OmniTunnel connects to it)"
     [[ -z "$p" ]] || tok_port_ok "$p" || die "invalid SSH port '$p' (want 1-65535)"
     [[ -f "$SSH_KNOWN_HOSTS" ]] || { info "no SSH host keys are pinned yet ($SSH_KNOWN_HOSTS)"; return 0; }
-    names=("$h")
-    if [[ -n "$p" ]]; then
-        [[ "$p" == 22 ]] || names+=("[$h]:$p")
+    if [[ -n "$p" && "$p" != 22 ]]; then
+        names=("[$h]:$p")
     else
-        n="$(ssh_kh_name "$h")"; [[ "$n" == "$h" ]] || names+=("$n")
+        names=("$h")
+        if [[ -z "$p" ]]; then n="$(ssh_kh_name "$h")"; [[ "$n" == "$h" ]] || names+=("$n"); fi
     fi
     for n in "${names[@]}"; do
         ssh-keygen -F "$n" -f "$SSH_KNOWN_HOSTS" >/dev/null 2>&1 || continue
@@ -1423,9 +1455,12 @@ guard_peer_downgrade() {
     # has no manager yet (the normal first-time case) the remote grep exits
     # non-zero, pipefail propagates it to the assignment, and set -e would abort
     # the WHOLE add/bench silently right after the "This box public IP" prompt.
-    local vf; vf="$(mktemp 2>/dev/null)" || die "cannot create a temp file for the foreign version check"
+    local vf otrap; otrap="$(trap -p EXIT)"
+    vf="$(mktemp 2>/dev/null)" || die "cannot create a temp file for the foreign version check"
+    tmp_track "$vf"; trap tmp_cleanup EXIT
     peer_ssh "$h" "grep -m1 -oE 'VERSION=\"[0-9.]+\"' /opt/omnitunnel/omnitunnel.sh 2>/dev/null | grep -oE '[0-9.]+'" >"$vf" 2>/dev/null </dev/null || true
-    pver="$(tr -d '\r\n ' < "$vf")"; rm -f "$vf"
+    pver="$(tr -d '\r\n ' < "$vf")"; tmp_cleanup "$vf"
+    if [[ -n "$otrap" ]]; then eval "$otrap"; else trap - EXIT; fi
     [[ -n "$pver" ]] || return 0                 # foreign has no OmniTunnel yet - just provision it
     ver_gt "$pver" "$VERSION" || return 0         # we are same-or-newer: safe to push
     warn "The foreign $h runs v$pver but this box is older (v$VERSION)."
