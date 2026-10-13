@@ -113,6 +113,26 @@ jobs:
           fi
           sudo bash tests/remove_nft_cleanup_test.sh | tee /tmp/remove_nft_cleanup_test.out
           grep -q '^PASSED - .* remove/nft cleanup cases' /tmp/remove_nft_cleanup_test.out
+      - name: SSH pin-race test (root, real sshd)
+        run: |
+          set -eo pipefail
+          if [ ! -x /usr/sbin/sshd ] || ! command -v sshpass >/dev/null; then
+            sudo apt-get update -qq
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq openssh-server sshpass
+          fi
+          sudo mkdir -p /run/sshd
+          sudo bash tests/ssh_pin_race_test.sh | tee /tmp/ssh_pin_race_test.out
+          grep -q '^PASSED - ssh_pin_race_test' /tmp/ssh_pin_race_test.out
+      - name: SSH modern-race test (root, real sshd)
+        run: |
+          set -eo pipefail
+          if [ ! -x /usr/sbin/sshd ] || ! command -v sshpass >/dev/null; then
+            sudo apt-get update -qq
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq openssh-server sshpass
+          fi
+          sudo mkdir -p /run/sshd
+          sudo bash tests/ssh_modern_race_test.sh | tee /tmp/ssh_modern_race_test.out
+          grep -q '^PASSED - ssh_modern_race_test' /tmp/ssh_modern_race_test.out
 
   direct-c:
     name: C core (${{ matrix.os }})

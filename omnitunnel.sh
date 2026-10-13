@@ -1442,8 +1442,10 @@ ssh_kh_init() {
 }
 ssh_accept_new_ok() { ssh -o StrictHostKeyChecking=accept-new -V >/dev/null 2>&1; }
 ssh_kh_name() {
-    local h="$1" g p
+    local h="$1" p a g
     g="$(ssh -G "${SSH_OPTS[@]}" "${PEER_USER:-root}@$h" 2>/dev/null)" || return 2
+    a="$(printf '%s\n' "$g" | awk '$1 == "hostkeyalias" && !n { print $2; n = 1 }')"
+    if [[ -n "$a" ]]; then printf '%s\n' "$a"; return 0; fi
     p="$(printf '%s\n' "$g" | awk '$1 == "port" && !n { print $2; n = 1 }')"
     if [[ "$p" =~ ^[0-9]+$ && "$p" != 22 ]]; then printf '[%s]:%s\n' "$h" "$p"; else printf '%s\n' "$h"; fi
 }
@@ -1454,20 +1456,23 @@ _hostkey_unlock() {
     HOSTKEY_LOCK_FD=""
 }
 _hostkey_opts() {
-    local kh fd lock="$SSH_KH_DIR/.first-contact.lock" w="${SSH_KH_LOCK_WAIT:-120}"
+    local kh fd lock="$SSH_KH_DIR/.first-contact.lock" w="${SSH_KH_LOCK_WAIT:-120}" modern=0
     HOSTKEY_LOCK_FD=""
-    if ssh_accept_new_ok; then HOSTKEY_OPTS=(-o StrictHostKeyChecking=accept-new); return 0; fi
-    HOSTKEY_OPTS=(-o StrictHostKeyChecking=yes)
+    if ssh_accept_new_ok; then modern=1; HOSTKEY_OPTS=(-o StrictHostKeyChecking=accept-new)
+    else HOSTKEY_OPTS=(-o StrictHostKeyChecking=yes); fi
     kh="$(ssh_kh_name "$1")" || die_loud "cannot resolve the SSH host-key name for $1 ('ssh -G' failed) - refusing to connect to an unverified target"
     ssh-keygen -F "$kh" -f "$SSH_KNOWN_HOSTS" >/dev/null 2>&1 && return 0
-    { exec {fd}>"$lock"; } 2>/dev/null ||
+    if ! { exec {fd}>"$lock"; } 2>/dev/null; then
+        [[ "$modern" == 1 ]] && return 0
         die_loud "cannot open the SSH first-contact lock $lock - not connecting to $1, whose key is not pinned yet (this ssh is older than OpenSSH 7.6)"
+    fi
     if ! flock -w "$w" "$fd" 2>/dev/null; then
         exec {fd}>&-
+        [[ "$modern" == 1 ]] && return 0
         die_loud "could not take the SSH first-contact lock $lock within ${w}s (another OmniTunnel run is contacting a new foreign) - not connecting to $1; retry"
     fi
     if ssh-keygen -F "$kh" -f "$SSH_KNOWN_HOSTS" >/dev/null 2>&1; then exec {fd}>&-; return 0; fi
-    HOSTKEY_OPTS=(-o StrictHostKeyChecking=no)
+    [[ "$modern" == 1 ]] || HOSTKEY_OPTS=(-o StrictHostKeyChecking=no)
     HOSTKEY_LOCK_FD="$fd"
 }
 hostkey_abort() {
@@ -1538,11 +1543,14 @@ cmd_forget_host() {
     tok_host_ok "$h" || die "usage: forget-host <host> [port]   (the foreign IP or name, as OmniTunnel connects to it)"
     [[ -z "$p" ]] || tok_port_ok "$p" || die "invalid SSH port '$p' (want 1-65535)"
     [[ -f "$SSH_KNOWN_HOSTS" ]] || { info "no SSH host keys are pinned yet ($SSH_KNOWN_HOSTS)"; return 0; }
-    if [[ -n "$p" && "$p" != 22 ]]; then
+    local eff; eff="$(ssh_kh_name "$h")" || die "cannot resolve the SSH host-key name for $h ('ssh -G' failed)"
+    if [[ "$eff" != "$h" && "$eff" != "[$h]:"* ]]; then
+        names=("$eff")
+    elif [[ -n "$p" && "$p" != 22 ]]; then
         names=("[$h]:$p")
     else
         names=("$h")
-        if [[ -z "$p" ]]; then n="$(ssh_kh_name "$h")" || die "cannot resolve the SSH host-key name for $h ('ssh -G' failed)"; [[ "$n" == "$h" ]] || names+=("$n"); fi
+        if [[ -z "$p" ]]; then [[ "$eff" == "$h" ]] || names+=("$eff"); fi
     fi
     for n in "${names[@]}"; do
         ssh-keygen -F "$n" -f "$SSH_KNOWN_HOSTS" >/dev/null 2>&1 || continue
@@ -1761,6 +1769,10 @@ cmd_add_auto() {
     local kn="$ADD_KN" fhost="$ADD_FHOST" auto_kn="$ADD_AUTO"
     local nc="${ADD_REST[0]:-16}" shape="${ADD_REST[1]:-none}" mylip="${ADD_REST[2]:-$(default_local_ip)}"
     [[ -n "$t" && -n "$kn" && -n "$fhost" ]] || die "usage: add-auto <type> [name] <foreign_ip> [nconn] [shape] [my_ip]"
+    tok_host_ok "$fhost" || die "invalid foreign address: $fhost"
+    tok_host_ok "$mylip" || die "invalid near address: $mylip"
+    tok_shape_ok "$shape" || die "invalid shape: $shape"
+    tok_nc_ok "$nc" || die "invalid nconn: $nc"
     [[ -n "$auto_kn" ]] || { inst_exists "$kn" && die "instance $kn exists"; }
     new_inst_lanes "$t"; local lanes="$NEW_LANES"
     [[ -n "${OMNITUN_PEER_PASS:-}" || -n "${OMNITUN_PEER_PROXY:-}" ]] && save_peer "$fhost" "${OMNITUN_PEER_USER:-root}" "${OMNITUN_PEER_PASS:-}" "${OMNITUN_PEER_PROXY:-}"
@@ -1823,6 +1835,10 @@ cmd_add_manual() {
     local kn="$ADD_KN" fhost="$ADD_FHOST" auto_kn="$ADD_AUTO"
     local nc="${ADD_REST[0]:-16}" shape="${ADD_REST[1]:-none}" mylip="${ADD_REST[2]:-$(default_local_ip)}" want_port="${ADD_REST[3]:-}"
     [[ -n "$t" && -n "$kn" && -n "$fhost" ]] || die "usage: add-manual <type> [name] <foreign_ip> [nconn] [shape] [my_ip] [foreign_port]"
+    tok_host_ok "$fhost" || die "invalid foreign address: $fhost"
+    tok_host_ok "$mylip" || die "invalid near address: $mylip"
+    tok_shape_ok "$shape" || die "invalid shape: $shape"
+    tok_nc_ok "$nc" || die "invalid nconn: $nc"
     [[ -n "$auto_kn" ]] || { inst_exists "$kn" && die "instance $kn exists"; }
     # icmp: this end's emitted ICMP type (OMNITUN_ICMP_MODE) and the foreign end's
     # (OMNITUN_ICMP_MODE_PEER), for paths that drop one echo type in one direction.
