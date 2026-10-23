@@ -17,7 +17,7 @@ extract() {
     }' "$SCRIPT"
 }
 
-eval "$(extract "tok_re inst_name_ok list_instances inst_path inst_conf inst_pf inst_exists load_inst type_is_hysteria dnat_chain norm_port pick_num rewrite_without pf_line_parse pf_line_fmt pf_entries pf_spec_parse pf_lock pf_unlock pf_log pf_backup pf_write pf_apply_all pf_add pf_del cmd_pf_del hy_creds hy_bw hy_render_config hy_relay_unit hy_reconcile_relays svc_name pick_instance pick_proto pick_fwd_port pf_confirm_del mux_conf menu_pf pause heading nitem rule_green")"
+eval "$(extract "tok_re inst_name_ok list_instances inst_path inst_conf inst_pf inst_exists load_inst type_is_hysteria dnat_chain norm_port pick_num rewrite_without pf_line_parse pf_line_fmt pf_entries pf_spec_parse with_pf_lock ipt pf_fwd_apply pf_fwd_drop _pf_flush_chain _pf_apply_all _pf_add _pf_del pf_log pf_backup pf_write pf_apply_all pf_add pf_del cmd_pf_del hy_creds hy_bw hy_render_config hy_relay_unit hy_reconcile_relays svc_name pick_instance pick_proto pick_fwd_port pf_confirm_del mux_conf menu_pf pause heading nitem rule_green")"
 eval "$(grep -E '^(C_|G_)[A-Z_]+=' "$SCRIPT")"
 
 FAILS=0
@@ -35,7 +35,7 @@ iptables() { printf '%s\n' "$*" >> "$IPT"; case " $* " in *" -C "*) return 1;; e
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
-ROOT_DIR="$WORK/etc"; INST_DIR="$ROOT_DIR/inst"; IPT="$WORK/ipt.log"
+ROOT_DIR="$WORK/etc"; INST_DIR="$ROOT_DIR/inst"; RUN_DIR="$WORK/run"; IPT="$WORK/ipt.log"
 mkdir -p "$INST_DIR"
 HY_MASQ_HOST="www.bing.com"; HY_RELAY="$WORK/socksfwd.py"
 
@@ -45,7 +45,7 @@ mk_inst() {
     printf '%b' "$3" > "$INST_DIR/$1/pf.conf"
 }
 pfc() { tr '\n' ' ' < "$INST_DIR/$1/pf.conf" 2>/dev/null; }
-dnats() { grep -- '-j DNAT' "$IPT" | sed 's/^-w //' | sort; }
+dnats() { grep -- '-j DNAT' "$IPT" | sed -E 's/^-w( [0-9]+)? //' | sort; }
 
 if [[ "${PF_MAP_RELAY:-}" == 1 ]]; then
     mount -t tmpfs pf-map-test /etc/systemd/system || { echo "FAIL: cannot shadow /etc/systemd/system"; exit 1; }

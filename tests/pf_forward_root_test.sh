@@ -34,7 +34,7 @@ extract() {
     }' "$SCRIPT"
 }
 
-eval "$(extract "tok_re inst_name_ok inst_path inst_conf inst_pf inst_exists load_inst dnat_chain type_is_hysteria ipt with_pf_lock pf_fwd_apply pf_fwd_drop _pf_apply_all pf_apply_all _pf_flush_chain pf_flush_chain cmd_postup validate_inst_name list_instances norm_port rewrite_without _pf_add pf_add _pf_del pf_del")"
+eval "$(extract "tok_re inst_name_ok inst_path inst_conf inst_pf inst_exists load_inst dnat_chain type_is_hysteria ipt with_pf_lock pf_fwd_apply pf_fwd_drop _pf_apply_all pf_apply_all _pf_flush_chain pf_flush_chain cmd_postup validate_inst_name list_instances norm_port rewrite_without pf_line_parse pf_line_fmt pf_entries pf_spec_parse pf_log pf_backup pf_write _pf_add pf_add _pf_del pf_del cmd_pf_del")"
 
 ok() { :; }
 warn() { :; }
@@ -56,6 +56,7 @@ cleanup() {
 trap cleanup EXIT
 INST_DIR="$WORK/inst"; mkdir -p "$INST_DIR"
 RUN_DIR="$WORK/run"; mkdir -p "$RUN_DIR"
+ROOT_DIR="$WORK/etc"; mkdir -p "$ROOT_DIR"
 
 cat > "$WORK/echo.py" <<'PY'
 import socket, sys, threading

@@ -16,7 +16,7 @@ extract() {
     }' "$SCRIPT"
 }
 
-eval "$(extract "tok_re inst_name_ok validate_inst_name list_instances inst_path inst_conf inst_pf inst_exists load_inst create_inst type_is_hysteria type_is_stripe type_is_ackless type_is_kernel type_is_revmux type_uses_key type_known dnat_chain norm_port pick_num rewrite_without lanes_ok tok_host_ok tok_ipv4_ok tok_port_ok tok_nc_ok tok_hexkey_ok tok_key_ok tok_shape_ok tok_pmode_ok cmd_server_token pf_line_parse pf_line_fmt pf_entries pf_spec_parse pf_lock pf_unlock pf_log pf_backup pf_write pf_archive_removed pf_apply_all pf_add pf_del cmd_pf_del pf_flush_chain pf_confirm_del pick_instance pick_proto pick_fwd_port mux_conf menu_pf inst_remove pause heading nitem rule_green")"
+eval "$(extract "tok_re inst_name_ok validate_inst_name list_instances inst_path inst_conf inst_pf inst_exists load_inst create_inst type_is_hysteria type_is_stripe type_is_ackless type_is_kernel type_is_revmux type_uses_key type_known dnat_chain norm_port pick_num rewrite_without lanes_ok tok_host_ok tok_ipv4_ok tok_port_ok tok_nc_ok tok_hexkey_ok tok_key_ok tok_shape_ok tok_pmode_ok cmd_server_token pf_line_parse pf_line_fmt pf_entries pf_spec_parse with_pf_lock ipt pf_fwd_apply pf_fwd_drop _pf_flush_chain _pf_apply_all _pf_add _pf_del pf_log pf_backup pf_write pf_archive_removed pf_apply_all pf_add pf_del cmd_pf_del pf_flush_chain pf_confirm_del pick_instance pick_proto pick_fwd_port mux_conf menu_pf _inst_remove_fwd inst_remove pause heading nitem rule_green")"
 eval "$(grep -E '^(C_|G_)[A-Z_]+=' "$SCRIPT")"
 eval "$(grep -m1 '^ALL_TYPES=' "$SCRIPT")"
 

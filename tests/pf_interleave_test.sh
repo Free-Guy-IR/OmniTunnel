@@ -17,7 +17,7 @@ extract() {
     }' "$SCRIPT"
 }
 
-eval "$(extract "tok_re inst_name_ok list_instances inst_path inst_conf inst_pf inst_exists load_inst type_is_hysteria dnat_chain norm_port rewrite_without pf_line_parse pf_line_fmt pf_entries pf_spec_parse pf_lock pf_unlock pf_log pf_backup pf_write pf_apply_all pf_add pf_del cmd_pf_del cmd_postup")"
+eval "$(extract "tok_re inst_name_ok list_instances inst_path inst_conf inst_pf inst_exists load_inst type_is_hysteria dnat_chain norm_port rewrite_without pf_line_parse pf_line_fmt pf_entries pf_spec_parse with_pf_lock ipt pf_fwd_apply pf_fwd_drop _pf_flush_chain _pf_apply_all _pf_add _pf_del pf_log pf_backup pf_write pf_apply_all pf_add pf_del cmd_pf_del cmd_postup")"
 
 FAILS=0
 bad() { echo "FAIL: $*"; FAILS=$((FAILS+1)); }
@@ -30,10 +30,11 @@ logger() { :; }
 apply_tuning() { :; }
 pf_warn_conflicts() { :; }
 iptables() {
-    local op="" ch="" proto="" dport="" to="" i
+    local op="" ch="" proto="" dport="" to="" tab=filter i
     local args=("$@")
     for ((i = 0; i < ${#args[@]}; i++)); do
         case "${args[i]}" in
+            -t) tab="${args[i+1]}";;
             -N|-F|-A|-C|-I|-D|-X) op="${args[i]}"; ch="${args[i+1]:-}";;
             -p) proto="${args[i+1]}";;
             --dport) dport="${args[i+1]}";;
@@ -41,6 +42,7 @@ iptables() {
         esac
     done
     sleep "0.00$((RANDOM % 6))"
+    [[ "$tab" == nat ]] || return 0
     case "$op" in
         -N) [[ -e "$NAT/$ch" ]] && return 1; : >> "$NAT/$ch";;
         -F) : > "$NAT/$ch";;
@@ -66,7 +68,7 @@ chain_vs_file() {
 }
 
 for r in $(seq 1 "$ROUNDS"); do
-    ROOT_DIR="$WORK/r$r/etc"; INST_DIR="$ROOT_DIR/inst"; NAT="$WORK/r$r/nat"
+    ROOT_DIR="$WORK/r$r/etc"; INST_DIR="$ROOT_DIR/inst"; NAT="$WORK/r$r/nat"; RUN_DIR="$WORK/r$r/run"
     mkdir -p "$INST_DIR" "$NAT"
     mk_inst alpha 1 ''
     mk_inst beta 2 'tcp:3999\n'

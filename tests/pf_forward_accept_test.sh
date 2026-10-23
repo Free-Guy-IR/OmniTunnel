@@ -15,7 +15,7 @@ extract() {
     }' "$SCRIPT"
 }
 
-eval "$(extract "tok_re inst_name_ok inst_path inst_conf inst_pf inst_exists load_inst dnat_chain type_is_hysteria with_pf_lock _pf_apply_all pf_apply_all ipt pf_fwd_apply pf_fwd_drop _pf_flush_chain pf_flush_chain")"
+eval "$(extract "tok_re inst_name_ok inst_path inst_conf inst_pf inst_exists load_inst dnat_chain type_is_hysteria norm_port pf_line_parse pf_entries with_pf_lock _pf_apply_all pf_apply_all ipt pf_fwd_apply pf_fwd_drop _pf_flush_chain pf_flush_chain")"
 
 fail() { echo "FAIL: $1" >&2; exit 1; }
 die() { echo "DIE: $*" >&2; exit 1; }

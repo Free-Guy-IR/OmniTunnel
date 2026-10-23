@@ -16,7 +16,7 @@ extract() {
     }' "$SCRIPT"
 }
 
-eval "$(extract "tok_re inst_name_ok tok_ipv4_ok list_instances inst_path inst_conf inst_pf inst_exists load_inst type_is_hysteria dnat_chain norm_port rewrite_without pf_line_parse pf_line_fmt pf_entries pf_spec_parse pf_lock pf_unlock pf_log pf_backup pf_write pf_apply_all pf_add pf_del nat_scan_awk nat_scan nat_rules_for pf_classify pf_chain_owner pf_describe pf_warn_conflicts pf_is_private pf_target_state pf_problems pf_status_report pf_probe pf_check")"
+eval "$(extract "tok_re inst_name_ok tok_ipv4_ok list_instances inst_path inst_conf inst_pf inst_exists load_inst type_is_hysteria dnat_chain norm_port rewrite_without pf_line_parse pf_line_fmt pf_entries pf_spec_parse with_pf_lock ipt pf_fwd_apply pf_fwd_drop _pf_flush_chain _pf_apply_all _pf_add _pf_del pf_log pf_backup pf_write pf_apply_all pf_add pf_del nat_scan_awk nat_scan nat_rules_for pf_classify pf_chain_owner pf_describe pf_warn_conflicts pf_is_private pf_target_state pf_problems pf_status_report pf_probe pf_check")"
 eval "$(grep -E '^(C_|G_)[A-Z_]+=' "$SCRIPT")"
 
 FAILS=0
@@ -33,7 +33,7 @@ WORK="$(mktemp -d)"
 LPIDS=()
 cleanup() { local p; for p in ${LPIDS[@]+"${LPIDS[@]}"}; do kill "$p" 2>/dev/null; done; rm -rf "$WORK"; }
 trap cleanup EXIT
-ROOT_DIR="$WORK/etc"; INST_DIR="$ROOT_DIR/inst"
+ROOT_DIR="$WORK/etc"; INST_DIR="$ROOT_DIR/inst"; RUN_DIR="$WORK/run"
 mkdir -p "$INST_DIR"
 PF_IPT_NAMES="$WORK/no-legacy"
 

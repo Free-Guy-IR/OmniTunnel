@@ -403,8 +403,12 @@ create_inst() {
     # reply-gated dodge), so default its ICMP_MODE to reply if unset.
     [[ "$t" == reverse-mux && -z "$imode" ]] && imode=reply
     validate_inst_name "$n"
+    inst_exists "$n" && die "instance '$n' already exists - refusing to overwrite its config and forwards"
     local dev="ts-$n"; [[ ${#dev} -gt 15 ]] && dev="ts$(printf '%s' "$n" | cksum | tr -dc '0-9' | cut -c1-8)"
-    mkdir -p "$(inst_path "$n")"; : > "$(inst_pf "$n")"
+    local npf; npf="$(inst_pf "$n")"
+    mkdir -p "$(inst_path "$n")"
+    if [[ -s "$npf" ]]; then mv -f "$npf" "$npf.bak-$(date -u +%Y%m%dT%H%M%S.%NZ)" || die "cannot set aside the leftover $npf"; fi
+    : > "$npf"
     cat > "$(inst_conf "$n")" <<EOF
 TYPE=$t
 ROLE=$role
@@ -544,14 +548,12 @@ EOF
         # a UDP forward is the one case that still restarts the engine). TCP
         # forwards are normally handled by standalone relays and are NOT emitted
         # here; only the python3-less fallback sets HY_TCP_IN_CONFIG=1.
-        local pf udp_e="" tcp_e="" proto port; pf="$(inst_pf "$n")"
-        if [[ -s "$pf" ]]; then
-            while IFS=: read -r proto port; do [[ -z "$proto" || -z "$port" ]] && continue
-                local blk="  - listen: 0.0.0.0:$port"$'\n'"    remote: 127.0.0.1:$port"$'\n'
-                [[ "$proto" == udp ]] && udp_e+="$blk"
-                [[ "$proto" == tcp && "${HY_TCP_IN_CONFIG:-0}" == 1 ]] && tcp_e+="$blk"
-            done < "$pf"
-        fi
+        local pf udp_e="" tcp_e="" proto port tgt blk; pf="$(inst_pf "$n")"
+        while read -r proto port tgt; do
+            blk="  - listen: 0.0.0.0:$port"$'\n'"    remote: 127.0.0.1:$tgt"$'\n'
+            [[ "$proto" == udp ]] && udp_e+="$blk"
+            [[ "$proto" == tcp && "${HY_TCP_IN_CONFIG:-0}" == 1 ]] && tcp_e+="$blk"
+        done < <(pf_entries "$pf")
         [[ -n "$tcp_e" ]] && { echo "tcpForwarding:" >> "$out"; printf '%s' "$tcp_e" >> "$out"; }
         [[ -n "$udp_e" ]] && { echo "udpForwarding:" >> "$out"; printf '%s' "$udp_e" >> "$out"; }
     fi
@@ -613,8 +615,8 @@ PYEOF
 # reconcile the running per-port relays with pf.conf (client side only)
 hy_reconcile_relays() {
     load_inst "$1"; local pf socksport="$PORT" changed=0; pf="$(inst_pf "$1")"
-    local want=(); if [[ -s "$pf" ]]; then local pr po
-        while IFS=: read -r pr po; do [[ "$pr" == tcp && -n "$po" ]] && want+=("$po"); done < "$pf"; fi
+    local want=() wtgt=() bounce=" " pr po tg i body
+    while read -r pr po tg; do [[ "$pr" == tcp ]] || continue; want+=("$po"); wtgt+=("$tg"); done < <(pf_entries "$pf")
     hy_write_relay_script
     # stop relays whose port is no longer wanted
     local f base port u
@@ -626,31 +628,35 @@ hy_reconcile_relays() {
         fi
     done
     # write units for wanted ports
-    for port in "${want[@]:-}"; do [[ -z "$port" ]] && continue
-        u="$(hy_relay_unit "$1" "$port")"
-        cat > "/etc/systemd/system/$u" <<EOF
-[Unit]
+    for ((i = 0; i < ${#want[@]}; i++)); do
+        port="${want[i]}"; u="$(hy_relay_unit "$1" "$port")"
+        body="[Unit]
 Description=OmniTunnel hysteria forward $1 tcp/$port
 After=network-online.target $(svc_name "$1")
 Wants=$(svc_name "$1")
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/env python3 $HY_RELAY 0.0.0.0 $port 127.0.0.1 $socksport 127.0.0.1 $port
+ExecStart=/usr/bin/env python3 $HY_RELAY 0.0.0.0 $port 127.0.0.1 $socksport 127.0.0.1 ${wtgt[i]}
 Restart=always
 RestartSec=2
 
 [Install]
-WantedBy=multi-user.target
-EOF
-        changed=1
+WantedBy=multi-user.target"
+        if [[ "$(cat "/etc/systemd/system/$u" 2>/dev/null)" != "$body" ]]; then
+            printf '%s\n' "$body" > "/etc/systemd/system/$u"; changed=1; bounce+="$u "
+        fi
     done
     [[ "$changed" == 1 ]] && systemctl daemon-reload
     # start only the relays that are not already up (existing ones stay untouched)
-    for port in "${want[@]:-}"; do [[ -z "$port" ]] && continue
-        u="$(hy_relay_unit "$1" "$port")"
+    for ((i = 0; i < ${#want[@]}; i++)); do
+        u="$(hy_relay_unit "$1" "${want[i]}")"
         systemctl enable "$u" >/dev/null 2>&1 || true
-        systemctl is-active --quiet "$u" || systemctl start "$u" >/dev/null 2>&1 || true
+        if [[ "$bounce" == *" $u "* ]] && systemctl is-active --quiet "$u"; then
+            systemctl restart "$u" >/dev/null 2>&1 || true
+        else
+            systemctl is-active --quiet "$u" || systemctl start "$u" >/dev/null 2>&1 || true
+        fi
     done
     return 0
 }
@@ -877,7 +883,7 @@ EOF
     fi
     systemctl daemon-reload || true
 }
-cmd_postup() { load_inst "$1"; apply_tuning "$DEV" "$SHAPE"; pf_apply_all "$1" || true; }
+cmd_postup() { load_inst "$1"; apply_tuning "$DEV" "$SHAPE"; ( pf_apply_all "$1" ) || true; }
 cmd_prefwd() { ensure_forwarding "" >/dev/null 2>&1 || true; return 0; }
 
 # Restart an instance's port-forward relays. A tunnel restart silently kills the
@@ -991,6 +997,105 @@ with_pf_lock() {
     fi
     "$@"
 }
+pf_line_parse() {
+    local LC_ALL=C l="${1%$'\r'}" t
+    PF_PROTO=""; PF_PUB=""; PF_TGT=""
+    [[ "$l" =~ ^(tcp|udp):([0-9]{1,5})(:([0-9]{1,5}))?$ ]] || return 1
+    PF_PROTO="${BASH_REMATCH[1]}"; t="${BASH_REMATCH[4]}"
+    PF_PUB="$(norm_port "${BASH_REMATCH[2]}")" || return 1
+    if [[ -n "$t" ]]; then PF_TGT="$(norm_port "$t")" || return 1; else PF_TGT="$PF_PUB"; fi
+    return 0
+}
+pf_line_fmt() {
+    if [[ "$2" == "$3" ]]; then printf '%s:%s\n' "$1" "$2"; else printf '%s:%s:%s\n' "$1" "$2" "$3"; fi
+}
+pf_entries() {
+    local line
+    [[ -f "$1" ]] || return 0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if pf_line_parse "$line"; then printf '%s %s %s\n' "$PF_PROTO" "$PF_PUB" "$PF_TGT"; fi
+    done < "$1"
+    return 0
+}
+pf_spec_parse() {
+    local LC_ALL=C item a b items=()
+    PF_SPEC=()
+    IFS=, read -r -a items <<< "$1"
+    for item in ${items[@]+"${items[@]}"}; do
+        item="${item//[[:space:]]/}"
+        [[ -n "$item" ]] || continue
+        if [[ "$item" =~ ^([0-9]{1,5}):([0-9]{1,5})$ ]]; then
+            a="${BASH_REMATCH[1]}"; b="${BASH_REMATCH[2]}"
+        elif [[ "$item" =~ ^[0-9]{1,5}$ ]]; then
+            a="$item"; b=""
+        else
+            warn "skipping invalid port '$item' (use <port> or <public>:<target>)"; continue
+        fi
+        a="$(norm_port "$a")" || { warn "skipping invalid port '$item' (ports are 1-65535)"; continue; }
+        if [[ -n "$b" ]]; then b="$(norm_port "$b")" || { warn "skipping invalid port '$item' (ports are 1-65535)"; continue; }; fi
+        PF_SPEC+=("$a${b:+ $b}")
+    done
+    return 0
+}
+pf_log() {
+    local f="$ROOT_DIR/pf.log" sz
+    sz="$(stat -c %s "$f" 2>/dev/null || echo 0)"
+    [[ "$sz" =~ ^[0-9]+$ && "$sz" -gt 1048576 ]] && mv -f "$f" "$f.1" 2>/dev/null
+    ( umask 077; printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >> "$f" ) 2>/dev/null || true
+    if command -v logger >/dev/null 2>&1; then logger -t omnitunnel -- "pf: $*" 2>/dev/null || true; fi
+    return 0
+}
+pf_backup() {
+    local pf b old=() i
+    pf="$(inst_pf "$1")"
+    [[ -s "$pf" ]] || return 0
+    b="$pf.bak-$(date -u +%Y%m%dT%H%M%S.%NZ)"
+    [[ -e "$b" ]] && b="$b.$$"
+    cp -p "$pf" "$b" 2>/dev/null || return 1
+    chmod 600 "$b" 2>/dev/null || true
+    old=("$pf".bak-*)
+    for ((i = 0; i < ${#old[@]} - ${PF_BAK_KEEP:-5}; i++)); do rm -f -- "${old[i]}"; done
+    return 0
+}
+pf_write() {
+    local n="$1" act="$2" d pf t on nn
+    d="$(inst_path "$n")"; pf="$(inst_pf "$n")"
+    [[ -d "$d" ]] || die "no instance directory for '$n'"
+    if [[ -L "$pf" ]] || [[ -e "$pf" && ! -f "$pf" ]]; then die "$pf is not a regular file - refusing to touch it"; fi
+    t="$(mktemp "$d/.pf.conf.XXXXXX" 2>/dev/null)" || die "cannot create a temp file in $d - nothing changed"
+    if ! cat > "$t"; then rm -f "$t"; die "could not write the new forward list of '$n' - nothing changed"; fi
+    if [[ -f "$pf" ]] && cmp -s "$t" "$pf"; then rm -f "$t"; return 0; fi
+    on="$(grep -c . "$pf" 2>/dev/null || true)"; on="${on:-0}"
+    nn="$(grep -c . "$t" 2>/dev/null || true)"; nn="${nn:-0}"
+    if [[ "$on" -gt 0 && "$nn" -eq 0 && "${PF_FORCE:-0}" != 1 ]]; then
+        rm -f "$t"
+        pf_log "$n $act REFUSED: it would remove the last $on forward line(s)"
+        die "this would remove the LAST forward(s) of '$n' and leave it forwarding nothing - nothing changed. Re-run with --force if that is really what you want"
+    fi
+    if ! pf_backup "$n"; then rm -f "$t"; die "could not back up $pf - nothing changed"; fi
+    chmod 600 "$t" 2>/dev/null || true
+    if ! mv -f "$t" "$pf"; then rm -f "$t"; die "could not replace $pf - nothing changed"; fi
+    if [[ "$on" -gt 0 && "$nn" -eq 0 ]]; then
+        pf_log "$n $act EMPTIED with --force: $on -> 0 forward line(s), previous list kept as a backup"
+    else
+        pf_log "$n $act: $on -> $nn forward line(s)"
+    fi
+    return 0
+}
+pf_archive_removed() {
+    local n="$1" pf a f old=() i
+    pf="$(inst_pf "$n")"
+    [[ -s "$pf" ]] || return 0
+    a="$ROOT_DIR/removed"
+    ( umask 077; mkdir -p "$a" ) 2>/dev/null || return 1
+    f="$a/$n.pf.conf.bak-$(date -u +%Y%m%dT%H%M%S.%NZ)"
+    cp -p "$pf" "$f" 2>/dev/null || return 1
+    chmod 600 "$f" 2>/dev/null || true
+    old=("$a/$n".pf.conf.bak-*)
+    for ((i = 0; i < ${#old[@]} - ${PF_BAK_KEEP:-5}; i++)); do rm -f -- "${old[i]}"; done
+    pf_log "$n removed: its $(grep -c . "$pf" 2>/dev/null || true) forward line(s) were archived to $f"
+    return 0
+}
 pf_apply_all() { with_pf_lock "$1" _pf_apply_all "$1"; }
 _pf_apply_all() {
     load_inst "$1"
@@ -1005,9 +1110,10 @@ _pf_apply_all() {
     ipt -t nat -N "$ch" 2>/dev/null || true; ipt -t nat -F "$ch"
     ipt -t nat -C PREROUTING -j "$ch" 2>/dev/null || ipt -t nat -I PREROUTING 1 -j "$ch"
     ipt -t nat -C POSTROUTING -o "$DEV" -j MASQUERADE 2>/dev/null || ipt -t nat -A POSTROUTING -o "$DEV" -j MASQUERADE
-    local proto port n=0
-    while IFS=: read -r proto port; do [[ -z "$proto" ]] && continue
-        ipt -t nat -A "$ch" -p "$proto" --dport "$port" -j DNAT --to-destination "$PEER_ADDR:$port"; n=$((n + 1)); done < "$pf"
+    local proto pub tgt n=0
+    while read -r proto pub tgt; do
+        ipt -t nat -A "$ch" -p "$proto" --dport "$pub" -j DNAT --to-destination "$PEER_ADDR:$tgt"; n=$((n + 1))
+    done < <(pf_entries "$pf")
     pf_fwd_apply "$1" "$ch" "$pf" "$n"
 }
 ipt() { iptables -w 10 "$@"; }
@@ -1039,31 +1145,71 @@ pf_fwd_drop() {
 }
 pf_add() { need_root; load_inst "$1"; with_pf_lock "$1" _pf_add "$@"; }
 _pf_add() {
-    local proto="$2" ports="$3"
+    local n="$1" proto="$2" spec="$3" pf pr prs item pub tgt x have added="" cur=()
     [[ "$proto" =~ ^(tcp|udp|both)$ ]] || die "proto must be tcp|udp|both"
     # accept several ports at once, comma-separated: pf-add <inst> tcp 8080,8081,700
-    local pf pr p np rc; pf="$(inst_pf "$1")"
-    for p in ${ports//,/ }; do
-        np="$(norm_port "$p")" || { warn "skipping invalid port '$p'"; continue; }
-        [[ -e "$pf" ]] || : > "$pf"
-        for pr in $([[ "$proto" == both ]] && echo "tcp udp" || echo "$proto"); do
-            rc=0; grep -qx "$pr:$np" "$pf" 2>/dev/null || rc=$?
-            [[ "$rc" -le 1 ]] || die "could not read $pf (grep exit $rc) - nothing added"
-            [[ "$rc" -eq 0 ]] || echo "$pr:$np" >> "$pf"; done
+    pf_spec_parse "$spec"
+    [[ ${#PF_SPEC[@]} -gt 0 ]] || die "no valid port in '$spec' - give <port> or <public>:<target>, comma-separated"
+    prs="$proto"; [[ "$proto" == both ]] && prs="tcp udp"
+    pf="$(inst_pf "$n")"
+    if [[ -f "$pf" ]]; then mapfile -t cur < "$pf"; fi
+    for item in "${PF_SPEC[@]}"; do
+        read -r pub tgt <<< "$item"; tgt="${tgt:-$pub}"
+        for pr in $prs; do
+            have=""
+            for x in ${cur[@]+"${cur[@]}"}; do
+                pf_line_parse "$x" || continue
+                if [[ "$PF_PROTO" == "$pr" && "$PF_PUB" == "$pub" ]]; then have="$PF_TGT"; break; fi
+            done
+            if [[ -z "$have" ]]; then
+                cur+=("$(pf_line_fmt "$pr" "$pub" "$tgt")"); added+=" $pr/$pub"
+            elif [[ "$have" != "$tgt" ]]; then
+                die "$pr/$pub on '$n' already goes to $PEER_ADDR:$have - remove it first (omnitunnel pf-del $n $pub)"
+            fi
+        done
     done
-    _pf_apply_all "$1"; ok "forwarding $proto/$ports through '$1' to $PEER_ADDR"
+    if [[ -n "$added" ]]; then pf_write "$n" "pf-add$added" < <(printf '%s\n' "${cur[@]}"); fi
+    _pf_apply_all "$n"
+    ok "forwarding $proto/$spec through '$n' to $PEER_ADDR"
 }
 pf_del() { need_root; load_inst "$1"; with_pf_lock "$1" _pf_del "$@"; }
 _pf_del() {
-    local ports="$2" pf p np; pf="$(inst_pf "$1")"
+    local n="$1" spec="$2" pf x item pub tgt drop keep=() dropped=() cur=()
     # accept several ports at once, comma-separated: pf-del <inst> 8080,8081
-    if [[ -f "$pf" ]]; then
-        for p in ${ports//,/ }; do
-            np="$(norm_port "$p")" || { warn "skipping invalid port '$p'"; continue; }
-            rewrite_without "$pf" ":0*$np\$" || die "could not rewrite $pf - nothing removed"
-        done
+    pf_spec_parse "$spec"
+    [[ ${#PF_SPEC[@]} -gt 0 ]] || die "no valid port in '$spec' - give <port> or <public>:<target>, comma-separated"
+    pf="$(inst_pf "$n")"
+    if [[ ! -f "$pf" ]]; then warn "'$n' has no forwards"; _pf_apply_all "$n"; return 0; fi
+    mapfile -t cur < "$pf"
+    for x in ${cur[@]+"${cur[@]}"}; do
+        drop=0
+        if pf_line_parse "$x"; then
+            for item in "${PF_SPEC[@]}"; do
+                read -r pub tgt <<< "$item"
+                if [[ "$PF_PUB" == "$pub" && ( -z "$tgt" || "$PF_TGT" == "$tgt" ) ]]; then drop=1; break; fi
+            done
+        fi
+        if [[ "$drop" == 1 ]]; then dropped+=("$x"); else keep+=("$x"); fi
+    done
+    if [[ ${#dropped[@]} -eq 0 ]]; then
+        warn "no forward on port(s) $spec in '$n' - nothing removed"; return 0
     fi
-    _pf_apply_all "$1"; ok "removed forward(s) on port(s) $ports from '$1'"
+    if [[ ${#keep[@]} -eq 0 ]]; then
+        pf_write "$n" "pf-del $spec" < /dev/null
+    else
+        pf_write "$n" "pf-del $spec" < <(printf '%s\n' "${keep[@]}")
+    fi
+    _pf_apply_all "$n"
+    ok "removed forward(s) ${dropped[*]} from '$n'"
+}
+cmd_pf_del() {
+    local a args=()
+    [[ "${OMNITUN_PF_FORCE:-0}" == 1 ]] && PF_FORCE=1
+    for a in "$@"; do
+        case "$a" in --force|-f) PF_FORCE=1;; *) args+=("$a");; esac
+    done
+    [[ ${#args[@]} -eq 2 ]] || die "usage: pf-del <instance> <port|public:target>[,...] [--force]"
+    pf_del "${args[0]}" "${args[1]}"
 }
 pf_flush_chain() { with_pf_lock "$1" _pf_flush_chain "$1"; }
 _pf_flush_chain() {
@@ -1301,6 +1447,7 @@ _inst_remove_fwd() {
     _pf_flush_chain "$n"; ip link del "$dev" 2>/dev/null || true
     inst_cleanup_residue "$dev"
     inst_nft_cleanup "$n" "$dev"
+    pf_archive_removed "$n" || warn "could not archive the forwards of '$n' before removing it"
     rm -rf "$(inst_path "$n")"
 }
 
@@ -1952,7 +2099,13 @@ cmd_server_token() {
     # die "already exists" on every retry - so the foreign could never be set up.
     # Replace it, then verify the unit actually came up and roll back if it did
     # not, so the token stays retryable.
-    inst_exists "$name" && { warn "instance '$name' already exists - replacing it"; inst_remove "$name" >/dev/null 2>&1 || true; }
+    if inst_exists "$name"; then
+        load_inst "$name"
+        if [[ "$ROLE" != server || -s "$(inst_pf "$name")" ]]; then
+            die "an instance named '$name' already exists on this box as a $ROLE$([[ -s "$(inst_pf "$name")" ]] && printf ' with port forwards') - refusing to replace it with this token; remove it first if that is really intended"
+        fi
+        warn "instance '$name' already exists - replacing it"; inst_remove "$name" >/dev/null 2>&1 || true
+    fi
     create_inst "$name" "$t" server "$fhost" "$mylip" "$port" "$key" "$pta" "$ppa" "$shape" "$nc" "$pmode" "" "$lanes"
     inst_enable "$name"
     if ! inst_running "$name"; then
@@ -2305,8 +2458,11 @@ bench_run() {
     # under 'set -e'. Relax it for the loop; each type just records FAIL instead.
     set +e
     for t in $ALL_TYPES; do
-        local name="bench-$t" sub=$((base+i)); i=$((i+1))
+        local name="bench-$t" sub=$((base+i)) pft; i=$((i+1))
         local ta="10.201.$sub.1" pa="10.201.$sub.2" port key nc=8 shape=none
+        if inst_exists "$name"; then
+            rows+=("$t|FAIL|FAIL|100%|n/a"); echo "  $t ... FAIL (a local instance named '$name' already exists - remove it, or run: omnitunnel bench-clean)"; continue
+        fi
         port=$(next_port $(( $(port_base "$t") + sub )) "$t"); key=$(gen_key)
         type_uses_key "$t" || key=""
         echo -n "  $t ... "
@@ -2319,7 +2475,7 @@ bench_run() {
             # download = parallel curl of the foreign's file server (forwarded
             # here on 5598); upload = iperf to the foreign's iperf server through
             # a second relay on 5599. Both ride the SOCKS5.
-            printf 'tcp:5598\ntcp:5599\n' > "$(inst_pf "$name")"
+            pft="$(mktemp "$(inst_path "$name")/.pf.conf.XXXXXX")" && printf 'tcp:5598\ntcp:5599\n' > "$pft" && mv -f "$pft" "$(inst_pf "$name")"
             inst_enable "$name" >/dev/null 2>&1; pf_apply_all "$name" >/dev/null 2>&1
             # wait (bounded ~30s) until the QUIC tunnel actually carries data before measuring
             local w hrtt hdl="" hul="" sz
@@ -2664,12 +2820,12 @@ pick_proto() {
 }
 # List instance $1's forwarded ports by number; set PORT_PICK to the chosen one.
 pick_fwd_port() {
-    PORT_PICK=""; PORT_KIND=""; local pf mc p dh dp ports=() kinds=() labels=() seen=" " i=1 x ch
+    PORT_PICK=""; PORT_KIND=""; local pf mc p dh dp pr tg ports=() kinds=() labels=() seen=" " i=1 x ch
     pf="$(inst_pf "$1")"; mc="$(mux_conf "$1")"
-    if [[ -s "$pf" ]]; then
-        while IFS=: read -r _ p; do [[ -z "$p" || "$seen" == *" $p "* ]] && continue
-            seen+="$p "; ports+=("$p"); kinds+=(pf); labels+=("port $p"); done < "$pf"
-    fi
+    while read -r pr p tg; do [[ "$seen" == *" $p "* ]] && continue
+        seen+="$p "; ports+=("$p"); kinds+=(pf)
+        if [[ "$tg" == "$p" ]]; then labels+=("port $p"); else labels+=("port $p  (-> peer port $tg)"); fi
+    done < <(pf_entries "$pf")
     if [[ -s "$mc" ]]; then
         while IFS=: read -r p dh dp; do [[ -z "$p" ]] && continue
             ports+=("$p"); kinds+=(mux); labels+=("port $p  (muxed -> $dh:$dp)"); done < "$mc"
@@ -2685,6 +2841,22 @@ pick_fwd_port() {
     return 0
 }
 
+pf_confirm_del() {
+    local n="$1" p="$2" pf x hit=() total=0 yn
+    pf="$(inst_pf "$n")"
+    if [[ -f "$pf" ]]; then
+        while IFS= read -r x || [[ -n "$x" ]]; do
+            [[ -n "$x" ]] || continue
+            total=$((total+1))
+            if pf_line_parse "$x" && [[ "$PF_PUB" == "$p" ]]; then hit+=("$x"); fi
+        done < "$pf"
+    fi
+    [[ ${#hit[@]} -gt 0 ]] || { warn "'$n' has no forward on port $p"; return 1; }
+    printf '  %bremove from tunnel %s:%b %s\n' "$C_BYEL" "$n" "$C_RESET" "${hit[*]}"
+    [[ ${#hit[@]} -lt $total ]] || warn "these are the LAST forwards of '$n' - it will forward nothing afterwards"
+    read -erp "  Remove them? [y/N]: " yn || true
+    [[ "$yn" =~ ^[Yy]([Ee][Ss])?$ ]]
+}
 # The home screen: wordmark, build info, this box, then the menu. Sub-screens
 # get the compact one-line header instead (pass a crumb).
 banner() {
@@ -2839,12 +3011,15 @@ menu_pf() {
             pf="$(inst_pf "$n")"; mc="$(mux_conf "$n")"; any=1
             printf '  %b%s%b %b%s%b\n' "$C_MAG" "$G_V" "$C_RESET" "$C_BOLD$C_WHITE" "$n" "$C_RESET"
             local shown=0
-            if [[ -s "$pf" ]]; then
-                local proto port
-                while IFS=: read -r proto port; do [[ -z "$proto" ]] && continue
-                    shown=1
-                    printf '       %b%s%b %b%-4s%b %s\n' "$C_GREEN" "$G_ARROW" "$C_RESET" "$C_CYAN" "$proto" "$C_RESET" "$port"; done < "$pf"
-            fi
+            local proto port tgt
+            while read -r proto port tgt; do
+                shown=1
+                if [[ "$tgt" == "$port" ]]; then
+                    printf '       %b%s%b %b%-4s%b %s\n' "$C_GREEN" "$G_ARROW" "$C_RESET" "$C_CYAN" "$proto" "$C_RESET" "$port"
+                else
+                    printf '       %b%s%b %b%-4s%b %s %b-> peer port %s%b\n' "$C_GREEN" "$G_ARROW" "$C_RESET" "$C_CYAN" "$proto" "$C_RESET" "$port" "$C_GREY" "$tgt" "$C_RESET"
+                fi
+            done < <(pf_entries "$pf")
             if [[ -s "$mc" ]]; then
                 local mp mdh mdp
                 while IFS=: read -r mp mdh mdp; do [[ -z "$mp" ]] && continue
@@ -2864,13 +3039,15 @@ menu_pf() {
         read -r c || exit 0
         case "$c" in
             1) if pick_instance; then n="$PICK"
-                 if pick_proto; then read -erp "  port number: " po
-                     if [[ "$po" =~ ^[0-9]+$ ]]; then pf_add "$n" "$PROTO" "$po"; else warn "port must be a number"; fi
+                 if pick_proto; then read -erp "  port number, or public:target to send it to another port (several: 443,8443:443): " po
+                     if [[ "$po" =~ ^[0-9]+(:[0-9]+)?(,[0-9]+(:[0-9]+)?)*$ ]]; then ( pf_add "$n" "$PROTO" "$po" ) || true; else warn "give a port number, or public:target"; fi
                  fi
                fi; pause;;
             2) if pick_instance; then n="$PICK"
                  if pick_fwd_port "$n"; then
-                     if [[ "$PORT_KIND" == mux ]]; then cmd_mux_del "$n" "$PORT_PICK"; else pf_del "$n" "$PORT_PICK"; fi
+                     if [[ "$PORT_KIND" == mux ]]; then cmd_mux_del "$n" "$PORT_PICK"
+                     elif pf_confirm_del "$n" "$PORT_PICK"; then ( PF_FORCE=1; pf_del "$n" "$PORT_PICK" ) || true
+                     else info "nothing removed"; fi
                  fi
                fi; pause;;
             0) return;;
@@ -2931,7 +3108,7 @@ case "${1:-menu}" in
     _remove)          need_root; inst_remove "${2:?instance}";;
     _remove_own)      shift; cmd_remove_own "$@";;
     pf-add)           pf_add "${2:?}" "${3:?}" "${4:?}";;
-    pf-del)           pf_del "${2:?}" "${3:?}";;
+    pf-del)           shift; cmd_pf_del "$@";;
     mux-add)          shift; cmd_mux_add "$@";;
     mux-del)          shift; cmd_mux_del "$@";;
     mux-token)        need_root; cmd_mux_token "${2:?token}";;
@@ -2960,5 +3137,5 @@ case "${1:-menu}" in
     update|upgrade)   need_root; cmd_update;;
     uninstall|purge)  need_root; cmd_uninstall;;
     version|-v|--version) echo "tunnelctl $VERSION (core: $($TSUITE_BIN version 2>/dev/null || echo n/a))";;
-    *) echo "usage: $0 [menu|bench|add|list|status <n>|enable <n>|remove <n>|pf-add <n> <proto> <port>|pf-del <n> <port>|mux-add <n> <pubport> <dsthost> <dstport>|mux-del <n> <pubport>|mux-token <tok>|forget-host <host> [port]|fix-forwarding|update|uninstall]";;
+    *) echo "usage: $0 [menu|bench|add|list|status <n>|enable <n>|remove <n>|pf-add <n> <proto> <port|public:target>[,...]|pf-del <n> <port>[,...] [--force]|mux-add <n> <pubport> <dsthost> <dstport>|mux-del <n> <pubport>|mux-token <tok>|forget-host <host> [port]|fix-forwarding|update|uninstall]";;
 esac
