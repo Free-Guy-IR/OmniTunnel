@@ -1145,7 +1145,7 @@ pf_fwd_drop() {
 }
 pf_add() { need_root; load_inst "$1"; with_pf_lock "$1" _pf_add "$@"; }
 _pf_add() {
-    local n="$1" proto="$2" spec="$3" pf pr prs item pub tgt x have added="" cur=()
+    local n="$1" proto="$2" spec="$3" pf pr prs item pub tgt x have added="" req=() cur=()
     [[ "$proto" =~ ^(tcp|udp|both)$ ]] || die "proto must be tcp|udp|both"
     # accept several ports at once, comma-separated: pf-add <inst> tcp 8080,8081,700
     pf_spec_parse "$spec"
@@ -1156,7 +1156,7 @@ _pf_add() {
     for item in "${PF_SPEC[@]}"; do
         read -r pub tgt <<< "$item"; tgt="${tgt:-$pub}"
         for pr in $prs; do
-            have=""
+            req+=("$pr/$pub"); have=""
             for x in ${cur[@]+"${cur[@]}"}; do
                 pf_line_parse "$x" || continue
                 if [[ "$PF_PROTO" == "$pr" && "$PF_PUB" == "$pub" ]]; then have="$PF_TGT"; break; fi
@@ -1171,6 +1171,7 @@ _pf_add() {
     if [[ -n "$added" ]]; then pf_write "$n" "pf-add$added" < <(printf '%s\n' "${cur[@]}"); fi
     _pf_apply_all "$n"
     ok "forwarding $proto/$spec through '$n' to $PEER_ADDR"
+    pf_warn_conflicts "$n" "${req[@]}"
 }
 pf_del() { need_root; load_inst "$1"; with_pf_lock "$1" _pf_del "$@"; }
 _pf_del() {
@@ -1218,6 +1219,334 @@ _pf_flush_chain() {
     ipt -t nat -F "$ch" 2>/dev/null || true; ipt -t nat -X "$ch" 2>/dev/null || true
     ipt -t nat -D POSTROUTING -o "$DEV" -j MASQUERADE 2>/dev/null || true
     pf_fwd_drop "$ch"
+}
+nat_scan_awk() {
+    awk -v src="$1" '
+        function prio_of(s,   a, n, v) {
+            n = split(s, a, " ")
+            v = a[1]
+            if (v == "dstnat") v = -100
+            else if (v == "srcnat") v = 100
+            else if (v == "filter") v = 0
+            else if (v == "mangle") v = -150
+            else if (v == "raw") v = -300
+            else if (v == "security") v = 50
+            else v = v + 0
+            if (n >= 3 && a[2] == "-") v -= a[3]
+            if (n >= 3 && a[2] == "+") v += a[3]
+            return v
+        }
+        function ports_of(r,   a, n, i, j, t, out) {
+            n = split(r, a, " ")
+            for (i = 1; i < n; i++) {
+                if (a[i] != "dport") continue
+                t = a[i + 1]
+                if (t == "!=" || t ~ /^@/ || t ~ /^\$/) return "*"
+                if (t == "{") {
+                    out = ""
+                    for (j = i + 2; j <= n && a[j] != "}"; j++) { t = a[j]; sub(/,$/, "", t); if (t != "") out = out (out == "" ? "" : ",") t }
+                    return (out == "" ? "*" : out)
+                }
+                return t
+            }
+            return "*"
+        }
+        function proto_of(r,   m) {
+            if (r ~ /(^| )tcp dport/) return "tcp"
+            if (r ~ /(^| )udp dport/) return "udp"
+            if (match(r, /meta l4proto \{[^}]*\}/)) { m = substr(r, RSTART + 13, RLENGTH - 13); gsub(/[{} ]/, "", m); return m }
+            if (match(r, /meta l4proto [a-z0-9]+/)) return substr(r, RSTART + 13, RLENGTH - 13)
+            if (match(r, /ip protocol [a-z0-9]+/)) return substr(r, RSTART + 12, RLENGTH - 12)
+            return "any"
+        }
+        function new_chain(k, f, t, c) {
+            if (!(k in nr)) nr[k] = 0
+            cf[k] = f; ct[k] = t; cc[k] = c
+        }
+        function add_dnat(k, p, d, act, tgt, pk,   i) {
+            i = ++nr[k]
+            rk[k, i] = "D"; rp[k, i] = p; rd[k, i] = d; ra[k, i] = act; rt[k, i] = tgt; rc[k, i] = pk
+        }
+        function add_jump(k, to,   i) {
+            i = ++nr[k]
+            rk[k, i] = "J"; rj[k, i] = to
+        }
+        function nft_rule(k, r,   a, tgt, pk) {
+            if (r == "}" || r == "") return
+            if (match(r, /(jump|goto) [^ ]+$/)) { split(substr(r, RSTART, RLENGTH), a, " "); add_jump(k, a[2]); return }
+            if (r !~ /(^| )(dnat|redirect)( |$)/) return
+            tgt = "-"; pk = "-"
+            if (match(r, / to [^ ]+/)) tgt = substr(r, RSTART + 4, RLENGTH - 4)
+            if (match(r, /counter packets [0-9]+/)) pk = substr(r, RSTART + 16, RLENGTH - 16)
+            add_dnat(k, proto_of(r), ports_of(r), (r ~ /(^| )redirect( |$)/) ? "redirect" : "dnat", tgt, pk)
+        }
+        function nft_line(line,   o, c, w, x) {
+            o = gsub(/\{/, "{", line); c = gsub(/\}/, "}", line)
+            if (depth == 0) {
+                if (line ~ /^table /) { split(line, w, " "); fam = w[2]; tab = w[3] }
+            } else if (depth == 1) {
+                split(line, w, " "); kind = w[1]; cur = ""
+                if (kind == "chain") { cur = fam SUBSEP tab SUBSEP w[2]; new_chain(cur, fam, tab, w[2]) }
+            } else if (depth == 2 && kind == "chain" && cur != "") {
+                if (line ~ /^type nat hook prerouting priority /) {
+                    x = line; sub(/^type nat hook prerouting priority /, "", x); sub(/;.*$/, "", x); bp[cur] = prio_of(x)
+                } else if (line !~ /^(type|policy|comment|devices) /) nft_rule(cur, line)
+            }
+            depth += o - c
+            if (depth < 0) depth = 0
+        }
+        function ipt_line(line,   w, n, i, j, k, pk, p, d, act, tgt, neg, x) {
+            if (line ~ /^\*/) { tab = substr(line, 2); return }
+            if (tab != "nat") return
+            n = split(line, w, " ")
+            if (line ~ /^:/) {
+                x = substr(w[1], 2); k = "ip" SUBSEP "nat" SUBSEP x; new_chain(k, "ip", "nat", x)
+                if (x == "PREROUTING") bp[k] = -100
+                return
+            }
+            pk = "-"; i = 1
+            if (w[1] ~ /^\[[0-9]+:[0-9]+\]$/) { pk = w[1]; gsub(/^\[|:.*$/, "", pk); i = 2 }
+            if (w[i] != "-A") return
+            k = "ip" SUBSEP "nat" SUBSEP w[i + 1]; new_chain(k, "ip", "nat", w[i + 1])
+            p = "any"; d = "*"; act = ""; tgt = "-"; neg = 0
+            for (j = i + 2; j <= n; j++) {
+                if (w[j] == "!") { neg = 1; continue }
+                if (w[j] == "-p" || w[j] == "--protocol") { if (!neg) p = w[j + 1]; j++ }
+                else if (w[j] == "--dport" || w[j] == "--destination-port" || w[j] == "--dports" || w[j] == "--destination-ports") { x = w[j + 1]; gsub(/:/, "-", x); if (!neg) d = x; j++ }
+                else if (w[j] == "-j" || w[j] == "-g") { act = w[j + 1]; j++ }
+                else if (w[j] == "--to-destination") { tgt = w[j + 1]; j++ }
+                else if (w[j] == "--to-ports") { tgt = ":" w[j + 1]; j++ }
+                neg = 0
+            }
+            if (act == "DNAT" || act == "REDIRECT") add_dnat(k, p, d, tolower(act), tgt, pk)
+            else if (act != "" && act !~ /^(ACCEPT|DROP|REJECT|RETURN|MASQUERADE|SNAT|LOG|MARK|CONNMARK|TCPMSS|NETMAP|CT|NOTRACK)$/) add_jump(k, act)
+        }
+        function walk(k, base, pr, d,   i, n, t) {
+            if (d > 12) return
+            n = nr[k]
+            for (i = 1; i <= n; i++) {
+                if (rk[k, i] == "J") {
+                    t = cf[k] SUBSEP ct[k] SUBSEP rj[k, i]
+                    if (t in nr) walk(t, base, pr, d + 1)
+                } else if (rk[k, i] == "D") {
+                    seq++
+                    print pr, seq, src, cf[k], ct[k], cc[k], base, rp[k, i], rd[k, i], ra[k, i], rt[k, i], rc[k, i]
+                }
+            }
+        }
+        {
+            line = $0; sub(/^[ \t]+/, "", line); sub(/[ \t]+$/, "", line)
+            if (src == "nft") nft_line(line); else ipt_line(line)
+        }
+        END { for (b in bp) walk(b, cc[b], bp[b], 0) }
+    '
+}
+nat_scan() {
+    local LC_ALL=C v
+    v="$(iptables -V 2>/dev/null || true)"
+    {
+        if command -v nft >/dev/null 2>&1; then
+            nft list ruleset 2>/dev/null | nat_scan_awk nft || true
+        elif [[ "$v" == *nf_tables* ]]; then
+            iptables-save -c -t nat 2>/dev/null | nat_scan_awk iptables-nft || true
+        fi
+        if grep -qx nat "${PF_IPT_NAMES:-/proc/net/ip_tables_names}" 2>/dev/null; then
+            if [[ -n "$v" && "$v" != *nf_tables* ]]; then
+                iptables-save -c -t nat 2>/dev/null | nat_scan_awk legacy || true
+            elif command -v iptables-legacy-save >/dev/null 2>&1; then
+                iptables-legacy-save -c -t nat 2>/dev/null | nat_scan_awk legacy || true
+            fi
+        fi
+    } | sort -k1,1n -k2,2n
+}
+nat_rules_for() {
+    awk -v P="$1" -v X="$2" '
+        function inports(spec, x,   a, n, i, r) {
+            if (spec == "*") return 1
+            n = split(spec, a, ",")
+            for (i = 1; i <= n; i++) {
+                if (index(a[i], "-")) { split(a[i], r, "-"); if (x >= r[1] + 0 && x <= r[2] + 0) return 1 }
+                else if (a[i] + 0 == x) return 1
+            }
+            return 0
+        }
+        NF >= 12 && ($8 == "any" || index("," $8 ",", "," P ",")) && inports($9, X + 0)
+    '
+}
+pf_classify() {
+    local ch hy=0
+    ch="$(dnat_chain "$1")"
+    load_inst "$1"; type_is_hysteria "$TYPE" && hy=1
+    nat_rules_for "$2" "$3" | awk -v ch="$ch" -v hy="$hy" '
+        { r[NR] = $0; p[NR] = $1; s[NR] = $2; sr[NR] = $3; f[NR] = $4; t[NR] = $5; c[NR] = $6; b[NR] = $7
+          if (!o && $4 == "ip" && $5 == "nat" && $6 == ch) o = NR }
+        END {
+            for (i = 1; i <= NR; i++) {
+                if (f[i] == "ip" && t[i] == "nat" && c[i] == ch) { print "OURS", r[i]; continue }
+                if (hy) k = "WINS"
+                else if (!o) k = "OTHER"
+                else if (p[i] < p[o]) k = "WINS"
+                else if (p[i] > p[o]) k = "LOSES"
+                else if (sr[i] == sr[o] && f[i] == f[o] && t[i] == t[o] && b[i] == b[o]) k = (s[i] < s[o]) ? "WINS" : "LOSES"
+                else k = "TIE"
+                print k, r[i]
+            }
+        }'
+}
+pf_chain_owner() {
+    local i
+    for i in $(list_instances); do
+        [[ "$(dnat_chain "$i")" == "$1" ]] && { printf "OmniTunnel instance '%s'" "$i"; return 0; }
+    done
+    printf 'table %s %s, chain %s' "$2" "$3" "$1"
+}
+pf_describe() {
+    local pr="$1" p="$2" cls pri src fam tab chn tgt who
+    read -r cls pri _ src fam tab chn _ _ _ _ tgt _ <<< "$3"
+    who="$(pf_chain_owner "$chn" "$fam" "$tab")"
+    [[ "$src" == legacy ]] && who="$who (iptables-legacy)"
+    case "$cls" in
+        WINS)  printf '%s/%s: %s (prerouting priority %s) sends it to %s BEFORE this forward - this forward gets none of that traffic' "$pr" "$p" "$who" "$pri" "$tgt";;
+        TIE)   printf '%s/%s: %s also sends it to %s at the SAME priority %s in another table - which one wins is not defined' "$pr" "$p" "$who" "$tgt" "$pri";;
+        LOSES) printf '%s/%s: duplicate DNAT in %s (prerouting priority %s) to %s - it runs after this forward, so it only matters if this forward goes away' "$pr" "$p" "$who" "$pri" "$tgt";;
+        *)     printf '%s/%s: %s (prerouting priority %s) sends it to %s' "$pr" "$p" "$who" "$pri" "$tgt";;
+    esac
+}
+pf_warn_conflicts() {
+    local n="$1" recs item pr p line
+    shift
+    [[ $# -gt 0 ]] || return 0
+    recs="$(nat_scan 2>/dev/null)" || recs=""
+    if [[ -z "$recs" ]]; then info "could not read the nat ruleset (nft / iptables-save) - forward conflict check skipped"; return 0; fi
+    for item in "$@"; do
+        pr="${item%/*}"; p="${item#*/}"
+        while IFS= read -r line; do
+            case "${line%% *}" in WINS|TIE) warn "$(pf_describe "$pr" "$p" "$line")";; esac
+        done < <(printf '%s\n' "$recs" | pf_classify "$n" "$pr" "$p")
+    done
+    return 0
+}
+pf_is_private() {
+    local LC_ALL=C
+    [[ "$1" =~ ^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.) ]]
+}
+pf_target_state() {
+    local ip="${1%%:*}" r dev
+    PF_TS="skip"
+    tok_ipv4_ok "$ip" || return 0
+    pf_is_private "$ip" || return 0
+    declare -p PF_TSTATE >/dev/null 2>&1 || declare -gA PF_TSTATE=()
+    if [[ -n "${PF_TSTATE[$ip]+x}" ]]; then PF_TS="${PF_TSTATE[$ip]}"; return 0; fi
+    r="$(ip -4 route get "$ip" 2>/dev/null | head -n1)" || r=""
+    if [[ -z "$r" ]]; then PF_TS="no route to $ip"
+    elif [[ "$r" == local\ * ]]; then PF_TS="up"
+    elif [[ "$r" == *" via "* ]]; then PF_TS="no tunnel carries $ip (it would leave via the default gateway)"
+    else
+        dev="$(sed -n 's/.* dev \([^ ]*\).*/\1/p' <<< "$r")"
+        if [[ -n "$dev" ]] && ! ip -o link show dev "$dev" 2>/dev/null | grep -q '[<,]UP[,>]'; then PF_TS="tunnel device $dev is down"
+        elif ping -c 2 -W 1 "$ip" >/dev/null 2>&1 </dev/null; then PF_TS="up"
+        else PF_TS="$ip does not answer ping (dev ${dev:-?}) - its tunnel looks down"; fi
+    fi
+    PF_TSTATE[$ip]="$PF_TS"
+    return 0
+}
+pf_problems() {
+    local n="$1" pr="$2" p="$3" rows="$4" line cls tgt any=0
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        cls="${line%% *}"; tgt="$(awk '{print $12}' <<< "$line")"
+        pf_target_state "$tgt"
+        case "$cls" in
+            OURS) any=1
+                  if [[ "$PF_TS" != up && "$PF_TS" != skip ]]; then warn "$pr/$p: this forward points at $tgt but $PF_TS"; PF_NPROB=$((PF_NPROB+1)); fi;;
+            WINS|TIE) warn "$(pf_describe "$pr" "$p" "$line")"; PF_NPROB=$((PF_NPROB+1))
+                  if [[ "$PF_TS" != up && "$PF_TS" != skip ]]; then warn "$pr/$p: that rule is STALE - $PF_TS"; fi;;
+            *)    if [[ "$PF_TS" != up && "$PF_TS" != skip ]]; then warn "$(pf_describe "$pr" "$p" "$line"); it is STALE - $PF_TS"
+                  else warn "$(pf_describe "$pr" "$p" "$line")"; fi
+                  PF_NPROB=$((PF_NPROB+1));;
+        esac
+    done <<< "$rows"
+    if [[ "$any" == 0 ]] && ! type_is_hysteria "$TYPE"; then
+        warn "$pr/$p: this forward is not in the live ruleset (run: omnitunnel enable $n)"; PF_NPROB=$((PF_NPROB+1))
+    fi
+    return 0
+}
+pf_status_report() {
+    local n="$1" pf recs pr p tg
+    load_inst "$n"; pf="$(inst_pf "$n")"
+    [[ -s "$pf" ]] || return 0
+    recs="$(nat_scan 2>/dev/null)" || recs=""
+    [[ -n "$recs" ]] || return 0
+    declare -gA PF_TSTATE=(); PF_NPROB=0
+    while read -r pr p tg; do
+        pf_problems "$n" "$pr" "$p" "$(printf '%s\n' "$recs" | pf_classify "$n" "$pr" "$p")"
+    done < <(pf_entries "$pf")
+    load_inst "$n"
+    return 0
+}
+pf_probe() {
+    local pr="$1" ip="$2" port="$3" r=""
+    if [[ "$pr" == tcp ]]; then
+        # shellcheck disable=SC2016
+        if timeout 4 bash -c 'exec 3<>"/dev/tcp/$0/$1"' "$ip" "$port" </dev/null 2>/dev/null; then echo "open (tcp connect ok)"; else echo "CLOSED or filtered (tcp connect failed)"; fi
+        return 0
+    fi
+    command -v python3 >/dev/null 2>&1 && r="$(timeout 8 python3 -c '
+import socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.settimeout(1.5)
+r = "noicmp"
+try:
+    s.connect((sys.argv[1], int(sys.argv[2])))
+    for _ in range(2):
+        try:
+            s.send(b"\0")
+            s.recv(2048)
+            r = "open"
+            break
+        except socket.timeout:
+            pass
+except ConnectionRefusedError:
+    r = "closed"
+except OSError:
+    r = "error"
+print(r)
+' "$ip" "$port" </dev/null 2>/dev/null)"
+    case "$r" in
+        open)   echo "open (udp reply)";;
+        noicmp) echo "no ICMP unreachable (udp sent, no reply - normal for most udp services)";;
+        closed) echo "CLOSED (ICMP port unreachable)";;
+        *)      echo "unknown (needs python3)";;
+    esac
+}
+pf_check() {
+    load_inst "$1"
+    local n="$1" pf recs pr p tg rows pk peer tgt out loss rtt live
+    pf="$(inst_pf "$n")"
+    tgt="$PEER_ADDR"; type_is_hysteria "$TYPE" && tgt="$PEER_IP"
+    out="$(ping -c 3 -W 2 "$tgt" </dev/null 2>/dev/null || true)"
+    loss="$(grep -oE '[0-9]+% packet loss' <<< "$out" | grep -oE '^[0-9]+' || true)"
+    rtt="$(awk -F'/' '/rtt|round-trip/{print $5}' <<< "$out" || true)"
+    if [[ -n "$rtt" ]]; then live="alive - ping $tgt: rtt ${rtt} ms, loss ${loss:-0}%"; else live="DOWN - no ping reply from $tgt"; fi
+    printf '  %b%s%b  %s %s, peer %s via %s\n' "$C_BOLD$C_WHITE" "$n" "$C_RESET" "$TYPE" "$ROLE" "$PEER_ADDR" "$DEV"
+    printf '  tunnel: %s\n' "$live"
+    PF_NPROB=0
+    [[ -n "$rtt" ]] || PF_NPROB=1
+    if [[ -z "$(pf_entries "$pf")" ]]; then printf '  no forwards\n'; return 0; fi
+    recs="$(nat_scan 2>/dev/null)" || recs=""
+    [[ -n "$recs" ]] || warn "could not read the nat ruleset - run as root with nft or iptables-save installed"
+    declare -gA PF_TSTATE=()
+    while read -r pr p tg; do
+        rows=""; [[ -z "$recs" ]] || rows="$(printf '%s\n' "$recs" | pf_classify "$n" "$pr" "$p")"
+        load_inst "$n"
+        pk="$(awk '$1 == "OURS" { print $13; exit }' <<< "$rows")"
+        if type_is_hysteria "$TYPE"; then peer="n/a (hysteria forwards through its engine)"; pk="${pk:-n/a}"
+        else peer="$(pf_probe "$pr" "$PEER_ADDR" "$tg")"; fi
+        printf '  %-4s %-5s -> %s:%-5s  rule packets: %-8s peer port: %s\n' "$pr" "$p" "$PEER_ADDR" "$tg" "${pk:-none}" "$peer"
+        [[ -z "$recs" ]] || pf_problems "$n" "$pr" "$p" "$rows"
+    done < <(pf_entries "$pf")
+    if [[ "$PF_NPROB" -eq 0 ]]; then ok "no forward problems found for '$n'"; else warn "$PF_NPROB problem(s) found for '$n' (report only - nothing was changed)"; fi
+    return 0
 }
 
 # ------------------------------------------------------------- mux (chisel) ---
@@ -3033,9 +3362,10 @@ menu_pf() {
         echo
         nitem 1 "Add a forward     (pick tunnel · protocol · port)" "$C_BGRN$C_BOLD"
         nitem 2 "Remove a forward  (pick tunnel · port)"            "$C_BRED$C_BOLD"
+        nitem 3 "Check forwards    (rule hits · peer port · conflicts)"
         nitem 0 "Back"
         rule_green
-        printf '  %bEnter your choice [0-2]:%b ' "$C_BGRN" "$C_RESET"
+        printf '  %bEnter your choice [0-3]:%b ' "$C_BGRN" "$C_RESET"
         read -r c || exit 0
         case "$c" in
             1) if pick_instance; then n="$PICK"
@@ -3050,6 +3380,7 @@ menu_pf() {
                      else info "nothing removed"; fi
                  fi
                fi; pause;;
+            3) if pick_instance; then ( need_root; pf_check "$PICK" ) || true; fi; pause;;
             0) return;;
         esac
     done
@@ -3102,13 +3433,14 @@ case "${1:-menu}" in
     bench-server)     need_root; cmd_bench_server "${2:?token}";;
     bench-clean)      need_root; cmd_bench_clean;;
     list)             for n in $(list_instances); do inst_status "$n"; done;;
-    status)           inst_status "${2:?instance}";;
+    status)           inst_status "${2:?instance}"; pf_status_report "$2";;
     enable)           inst_enable "${2:?instance}";;
     remove)           need_root; remove_instance_fully "${2:?instance}";;
     _remove)          need_root; inst_remove "${2:?instance}";;
     _remove_own)      shift; cmd_remove_own "$@";;
     pf-add)           pf_add "${2:?}" "${3:?}" "${4:?}";;
     pf-del)           shift; cmd_pf_del "$@";;
+    pf-check)         need_root; pf_check "${2:?instance}";;
     mux-add)          shift; cmd_mux_add "$@";;
     mux-del)          shift; cmd_mux_del "$@";;
     mux-token)        need_root; cmd_mux_token "${2:?token}";;
@@ -3137,5 +3469,5 @@ case "${1:-menu}" in
     update|upgrade)   need_root; cmd_update;;
     uninstall|purge)  need_root; cmd_uninstall;;
     version|-v|--version) echo "tunnelctl $VERSION (core: $($TSUITE_BIN version 2>/dev/null || echo n/a))";;
-    *) echo "usage: $0 [menu|bench|add|list|status <n>|enable <n>|remove <n>|pf-add <n> <proto> <port|public:target>[,...]|pf-del <n> <port>[,...] [--force]|mux-add <n> <pubport> <dsthost> <dstport>|mux-del <n> <pubport>|mux-token <tok>|forget-host <host> [port]|fix-forwarding|update|uninstall]";;
+    *) echo "usage: $0 [menu|bench|add|list|status <n>|enable <n>|remove <n>|pf-add <n> <proto> <port|public:target>[,...]|pf-del <n> <port>[,...] [--force]|pf-check <n>|mux-add <n> <pubport> <dsthost> <dstport>|mux-del <n> <pubport>|mux-token <tok>|forget-host <host> [port]|fix-forwarding|update|uninstall]";;
 esac
