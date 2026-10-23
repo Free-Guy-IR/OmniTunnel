@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+# shellcheck disable=SC2034,SC2317
+set -u
+
+SCRIPT="${1:-$(dirname "$0")/../omnitunnel.sh}"
+ROUNDS="${PF_ILV_ROUNDS:-3}"
+
+extract() {
+    awk -v names="$1" '
+    BEGIN { n=split(names, a, " "); for (i=1;i<=n;i++) want[a[i]]=1 }
+    inblock { print; if ($0 ~ /^}/) inblock=0; next }
+    {
+        if (match($0, /^[A-Za-z0-9_]+\(\)[ \t]*\{/)) {
+            nm=$0; sub(/\(\).*/, "", nm)
+            if (nm in want) { print; if ($0 !~ /\}/) inblock=1 }
+        }
+    }' "$SCRIPT"
+}
+
+eval "$(extract "tok_re inst_name_ok list_instances inst_path inst_conf inst_pf inst_exists load_inst type_is_hysteria dnat_chain norm_port rewrite_without pf_line_parse pf_line_fmt pf_entries pf_spec_parse pf_lock pf_unlock pf_log pf_backup pf_write pf_apply_all pf_add pf_del cmd_pf_del cmd_postup")"
+
+FAILS=0
+bad() { echo "FAIL: $*"; FAILS=$((FAILS+1)); }
+need_root() { :; }
+ok() { :; }
+info() { :; }
+warn() { :; }
+die() { echo "DIE: $*" >&2; exit 1; }
+logger() { :; }
+apply_tuning() { :; }
+pf_warn_conflicts() { :; }
+iptables() {
+    local op="" ch="" proto="" dport="" to="" i
+    local args=("$@")
+    for ((i = 0; i < ${#args[@]}; i++)); do
+        case "${args[i]}" in
+            -N|-F|-A|-C|-I|-D|-X) op="${args[i]}"; ch="${args[i+1]:-}";;
+            -p) proto="${args[i+1]}";;
+            --dport) dport="${args[i+1]}";;
+            --to-destination) to="${args[i+1]}";;
+        esac
+    done
+    sleep "0.00$((RANDOM % 6))"
+    case "$op" in
+        -N) [[ -e "$NAT/$ch" ]] && return 1; : >> "$NAT/$ch";;
+        -F) : > "$NAT/$ch";;
+        -A) [[ "$ch" == TSUITE_* ]] && printf '%s %s %s\n' "$proto" "$dport" "$to" >> "$NAT/$ch";;
+    esac
+    return 0
+}
+
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+
+mk_inst() {
+    mkdir -p "$INST_DIR/$1"
+    printf 'TYPE=gre\nROLE=client\nLOCAL_IP=1.2.3.4\nPEER_IP=203.0.113.9\nTUN_ADDR=10.201.%s.1\nPEER_ADDR=10.201.%s.2\nPORT=51820\nKEY=\nDEV=ts-%s\nMTU=1400\n' "$2" "$2" "$1" > "$INST_DIR/$1/instance.conf"
+    printf '%b' "$3" > "$INST_DIR/$1/pf.conf"
+}
+chain_vs_file() {
+    local n="$1" ch want have
+    ch="TSUITE_$(echo "$n" | tr '[:lower:]-' '[:upper:]_')"
+    want="$(awk -F: -v pa="$2" 'NF >= 2 { print $1, $2 + 0, pa ":" (NF == 3 ? $3 + 0 : $2 + 0) }' "$INST_DIR/$n/pf.conf" | sort)"
+    have="$(sort "$NAT/$ch" 2>/dev/null)"
+    [[ "$want" == "$have" ]] || bad "round $r: kernel chain $ch [$(tr '\n' ' ' <<< "$have")] does not match ${n}'s pf.conf [$(tr '\n' ' ' <<< "$want")] - a stale or interleaved apply won"
+}
+
+for r in $(seq 1 "$ROUNDS"); do
+    ROOT_DIR="$WORK/r$r/etc"; INST_DIR="$ROOT_DIR/inst"; NAT="$WORK/r$r/nat"
+    mkdir -p "$INST_DIR" "$NAT"
+    mk_inst alpha 1 ''
+    mk_inst beta 2 'tcp:3999\n'
+    for i in $(seq 0 11); do
+        ( set -euo pipefail; pf_add alpha tcp "$((2000 + i))" ) >/dev/null 2>&1 &
+        ( set -euo pipefail; pf_add beta tcp "$((3000 + i))" ) >/dev/null 2>&1 &
+        ( set -euo pipefail; pf_add beta udp 999 ) >/dev/null 2>&1 &
+        ( set -euo pipefail; pf_del beta 999 ) >/dev/null 2>&1 &
+        ( set -euo pipefail; cmd_postup alpha; cmd_postup beta ) >/dev/null 2>&1 &
+    done
+    wait
+
+    want="$(printf 'tcp:%s\n' $(seq 2000 2011) | sort)"
+    have="$(sort "$INST_DIR/alpha/pf.conf")"
+    [[ "$have" == "$want" ]] || bad "round $r: alpha lost or duplicated forwards under concurrency: got [$(tr '\n' ' ' <<< "$have")]"
+    for i in $(seq 0 11) 999; do
+        p=$((3000 + i)); [[ "$i" == 999 ]] && p=3999
+        c="$(grep -cx "tcp:$p" "$INST_DIR/beta/pf.conf" || true)"
+        [[ "$c" == 1 ]] || bad "round $r: beta has tcp:$p $c time(s) - a concurrent pf-del rewrote the file over a concurrent pf-add"
+    done
+    c="$(grep -cx 'udp:999' "$INST_DIR/beta/pf.conf" || true)"
+    [[ "$c" -le 1 ]] || bad "round $r: beta has udp:999 $c times"
+    bogus="$(grep -cvE '^(tcp|udp):[0-9]+$' "$INST_DIR/beta/pf.conf" "$INST_DIR/alpha/pf.conf" | awk -F: '{s+=$2} END {print s+0}')"
+    [[ "$bogus" == 0 ]] || bad "round $r: corrupted lines in a pf.conf"
+    [[ -z "$(find "$INST_DIR" -name '.pf.conf.*' -o -name 'pf.conf.??????')" ]] || bad "round $r: temp files left behind"
+
+    chain_vs_file alpha 10.201.1.2
+    chain_vs_file beta 10.201.2.2
+done
+
+if [[ "$FAILS" -ne 0 ]]; then echo "pf_interleave_test: $FAILS failure(s)"; exit 1; fi
+echo "PASSED - pf_interleave_test: $ROUNDS rounds of concurrent pf-add/pf-del on two instances plus concurrent _postup applies (install restarts) lose no forward, duplicate none, leave no temp file, and the kernel chains end equal to pf.conf"
