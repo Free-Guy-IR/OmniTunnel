@@ -16,7 +16,7 @@ extract() {
     }' "$SCRIPT"
 }
 
-eval "$(extract "tok_re inst_name_ok tok_ipv4_ok list_instances inst_path inst_conf inst_pf inst_exists load_inst type_is_hysteria dnat_chain norm_port rewrite_without pf_line_parse pf_line_fmt pf_entries pf_spec_parse with_pf_lock ipt pf_fwd_apply pf_fwd_drop _pf_flush_chain _pf_apply_all _pf_add _pf_del pf_log pf_backup pf_write pf_apply_all pf_add pf_del nat_scan_awk nat_scan nat_rules_for pf_classify pf_chain_owner pf_describe pf_warn_conflicts pf_is_private pf_target_state pf_problems pf_status_report pf_probe pf_check")"
+eval "$(extract "tok_re inst_name_ok tok_ipv4_ok list_instances inst_path inst_conf inst_pf inst_exists load_inst type_is_hysteria dnat_chain norm_port rewrite_without pf_line_parse pf_line_fmt pf_entries pf_spec_parse with_pf_lock ipt pf_fwd_apply pf_fwd_drop _pf_flush_chain _pf_apply_all _pf_add _pf_del pf_log pf_backup pf_write pf_apply_all pf_add pf_del nat_scan_awk nat_scan nat_rules_for pf_classify pf_chain_owner pf_describe pf_warn_conflicts pf_is_private pf_target_state pf_have_ping pf_problems pf_status_report pf_probe pf_check")"
 eval "$(grep -E '^(C_|G_)[A-Z_]+=' "$SCRIPT")"
 
 FAILS=0
@@ -194,6 +194,17 @@ sub="$(
     mk_inst leg 2 'tcp:400\n'
     out="$( ( set -euo pipefail; printf '%s\n' "$recs" | pf_classify leg tcp 400 ) 2>&1 )"
     if ! { grep -q '^OURS .* TSUITE_LEG ' <<< "$out" && grep -q '^LOSES .* OBSC_DNAT ' <<< "$out"; }; then bad "C9 legacy precedence: want OURS for TSUITE_LEG and LOSES for OBSC_DNAT: $out"; fi
+)"
+[[ -z "$sub" ]] || printf '%s\n' "$sub"
+FAILS=$((FAILS + $(grep -c '^FAIL:' <<< "$sub")))
+
+sub="$(
+    pf_have_ping() { return 1; }
+    ping() { echo "ping must not run when it is not installed"; return 1; }
+    pf_probe() { echo "probe"; }
+    out="$( ( set -euo pipefail; pf_check mooo ) 2>&1 | sed 's/\x1b\[[0-9;]*[A-Za-z]//g')"
+    grep -q 'tunnel: unknown - ping is not installed' <<< "$out" || bad "C11 without ping pf-check must not call the tunnel down: $out"
+    grep -q 'does not answer ping\|tunnel: DOWN\|ping must not run' <<< "$out" && bad "C11 without ping a live target was reported dead: $out"
 )"
 [[ -z "$sub" ]] || printf '%s\n' "$sub"
 FAILS=$((FAILS + $(grep -c '^FAIL:' <<< "$sub")))
