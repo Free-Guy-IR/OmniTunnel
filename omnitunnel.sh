@@ -998,12 +998,13 @@ with_pf_lock() {
     "$@"
 }
 pf_line_parse() {
-    local LC_ALL=C l="${1%$'\r'}" t
+    local LC_ALL=C l="${1%$'\r'}" a b
     PF_PROTO=""; PF_PUB=""; PF_TGT=""
     [[ "$l" =~ ^(tcp|udp):([0-9]{1,5})(:([0-9]{1,5}))?$ ]] || return 1
-    PF_PROTO="${BASH_REMATCH[1]}"; t="${BASH_REMATCH[4]}"
-    PF_PUB="$(norm_port "${BASH_REMATCH[2]}")" || return 1
-    if [[ -n "$t" ]]; then PF_TGT="$(norm_port "$t")" || return 1; else PF_TGT="$PF_PUB"; fi
+    a=$((10#${BASH_REMATCH[2]})); b="${BASH_REMATCH[4]}"
+    if [[ -n "$b" ]]; then b=$((10#$b)); else b="$a"; fi
+    (( a >= 1 && a <= 65535 && b >= 1 && b <= 65535 )) || return 1
+    PF_PROTO="${BASH_REMATCH[1]}"; PF_PUB="$a"; PF_TGT="$b"
     return 0
 }
 pf_line_fmt() {
@@ -1272,6 +1273,7 @@ nat_scan_awk() {
             rk[k, i] = "J"; rj[k, i] = to
         }
         function nft_rule(k, r,   a, tgt, pk) {
+            sub(/ comment ".*"$/, "", r)
             if (r == "}" || r == "") return
             if (match(r, /(jump|goto) [^ ]+$/)) { split(substr(r, RSTART, RLENGTH), a, " "); add_jump(k, a[2]); return }
             if (r !~ /(^| )(dnat|redirect)( |$)/) return
@@ -1283,10 +1285,10 @@ nat_scan_awk() {
         function nft_line(line,   o, c, w, x) {
             o = gsub(/\{/, "{", line); c = gsub(/\}/, "}", line)
             if (depth == 0) {
-                if (line ~ /^table /) { split(line, w, " "); fam = w[2]; tab = w[3] }
+                if (line ~ /^table /) { split(line, w, " "); fam = w[2]; tab = w[3]; skipt = (fam != "ip" && fam != "inet") }
             } else if (depth == 1) {
                 split(line, w, " "); kind = w[1]; cur = ""
-                if (kind == "chain") { cur = fam SUBSEP tab SUBSEP w[2]; new_chain(cur, fam, tab, w[2]) }
+                if (kind == "chain" && !skipt) { cur = fam SUBSEP tab SUBSEP w[2]; new_chain(cur, fam, tab, w[2]) }
             } else if (depth == 2 && kind == "chain" && cur != "") {
                 if (line ~ /^type nat hook prerouting priority /) {
                     x = line; sub(/^type nat hook prerouting priority /, "", x); sub(/;.*$/, "", x); bp[cur] = prio_of(x)
