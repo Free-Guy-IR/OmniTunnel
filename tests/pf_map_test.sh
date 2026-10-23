@@ -92,6 +92,11 @@ mk_inst m4z 5 'tcp:0400\n'
 ( set -euo pipefail; pf_apply_all m4z ) >/dev/null 2>&1
 dnats | grep -qx -- '-t nat -A TSUITE_M4Z -p tcp --dport 400 -j DNAT --to-destination 10.201.5.2:400' || bad "M4 a zero-padded legacy line is not applied as decimal 400: $(dnats | tr '\n' '|')"
 
+mk_inst m4x 15 'tcp:0\nudp:65536\ntcp:1:0\ntcp:2:70000\nsctp:5\ntcp:12 \ntcp:13\n'
+: > "$IPT"
+( set -euo pipefail; pf_apply_all m4x ) >/dev/null 2>&1
+[[ "$(dnats)" == '-t nat -A TSUITE_M4X -p tcp --dport 13 -j DNAT --to-destination 10.201.15.2:13' ]] || bad "M4 out-of-range or malformed stored lines are applied: $(dnats | tr '\n' '|')"
+
 mk_inst m5 6 'tcp:443:8443\nudp:443:8443\ntcp:9000:9001\ntcp:9000\n'
 ( set -euo pipefail; pf_del m5 443 ) >/dev/null 2>&1 || bad "M5 pf-del m5 443 failed"
 [[ "$(pfc m5)" == "tcp:9000:9001 tcp:9000 " ]] || bad "M5 pf-del 443 left [$(pfc m5)], want only the 9000 lines"

@@ -52,6 +52,7 @@ table ip nat {
 		counter packets 5 bytes 300 jump TSUITE_OLD
 		meta l4proto tcp tcp dport 8080 counter packets 0 bytes 0 dnat to 10.202.50.2:8080
 		fib daddr type local counter packets 0 bytes 0 jump DOCKER
+		fib daddr type local counter packets 0 bytes 0 jump KUBE comment "kubernetes service portals"
 	}
 	chain TSUITE_MOOO {
 		meta l4proto tcp tcp dport 700 counter packets 84 bytes 5040 dnat to 10.201.6.2:700
@@ -67,6 +68,9 @@ table ip nat {
 	chain DOCKER {
 		iifname "docker0" counter packets 0 bytes 0 return
 		iifname != "docker0" meta l4proto tcp tcp dport 5000 counter packets 0 bytes 0 dnat to 172.17.0.2:80
+	}
+	chain KUBE {
+		meta l4proto tcp tcp dport 7777 counter packets 0 bytes 0 dnat to 10.96.0.10:53 comment "kube dns"
 	}
 	chain POSTROUTING {
 		type nat hook postrouting priority srcnat; policy accept;
@@ -95,6 +99,12 @@ table ip late {
 	chain pre {
 		type nat hook prerouting priority 10; policy accept;
 		udp dport 4702 dnat to 10.201.6.9:4702
+	}
+}
+table ip6 nat6 {
+	chain pre {
+		type nat hook prerouting priority -200; policy accept;
+		tcp dport 700 dnat to [fd00::2]:700
 	}
 }
 table ip filt {
@@ -135,7 +145,9 @@ grep -qx -- '-100 [0-9]* nft ip nat TSUITE_MOOO PREROUTING tcp 700 dnat 10.201.6
 grep -qx -- '-100 [0-9]* nft ip nat DOCKER PREROUTING tcp 5000 dnat 172.17.0.2:80 0' <<< "$recs" || bad "C1 nat_scan did not follow the conditional jump into DOCKER"
 grep -qx -- '-100 [0-9]* nft inet same pre pre tcp,udp 700 dnat 10.9.9.9:700 -' <<< "$recs" || bad "C1 nat_scan did not read the inet l4proto set rule"
 grep -q 'filt\|9\.9\.9\.9 \|masquerade' <<< "$recs" && bad "C1 nat_scan reported a non-DNAT or non-prerouting rule"
-[[ "$(grep -c . <<< "$recs")" == 13 ]] || bad "C1 nat_scan returned $(grep -c . <<< "$recs") records, want 13"
+grep -qx -- '-100 [0-9]* nft ip nat KUBE PREROUTING tcp 7777 dnat 10.96.0.10:53 0' <<< "$recs" || bad "C1 nat_scan did not follow a jump that carries a trailing comment"
+grep -q ' ip6 \|fd00' <<< "$recs" && bad "C1 nat_scan reported an IPv6 DNAT against IPv4 forwards"
+[[ "$(grep -c . <<< "$recs")" == 14 ]] || bad "C1 nat_scan returned $(grep -c . <<< "$recs") records, want 14"
 
 out="$( ( set -euo pipefail; pf_add mooo tcp 4702 ) 2>&1 )"
 grep -q 'tcp/4702: table ip ackless_pf, chain pre (prerouting priority -120) sends it to 10.204.50.2:702 BEFORE this forward' <<< "$out" || bad "C2 pf-add did not warn that ackless_pf (priority -120) shadows tcp/4702: $out"
