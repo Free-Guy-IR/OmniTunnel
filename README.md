@@ -327,12 +327,31 @@ new instance, and (given an SSH login to the far side) brings up both ends.
 Expose a port on one side and have it tunneled to the other:
 
 ```bash
-omnitunnel pf-add <instance> both 443     # tcp+udp 443 -> peer over the tunnel
+omnitunnel pf-add <instance> both 443          # tcp+udp 443 -> peer:443 over the tunnel
 omnitunnel pf-add <instance> tcp  8080
-omnitunnel pf-del <instance> 443
+omnitunnel pf-add <instance> tcp  4702:702     # public 4702 -> peer:702 (port mapping)
+omnitunnel pf-add <instance> both 443,8443:443 # several at once
+omnitunnel pf-del <instance> 443               # every forward on public port 443
+omnitunnel pf-del <instance> 4702 --force      # needed when it removes the LAST forward
+omnitunnel pf-check <instance>                 # rule hits, peer port, conflicts, stale rules
 ```
 
-or use the **Port forwarding** menu.
+or use the **Port forwarding** menu (it lists mapped forwards as
+`4702 -> peer port 702` and asks before it removes anything).
+
+- `pf.conf` keeps the old `proto:port` lines for plain forwards and adds
+  `proto:public:target` lines for mapped ones. Managers older than v2.9.14 do
+  not understand the mapped form, so do not downgrade a box that has mapped
+  forwards.
+- Every change replaces `pf.conf` atomically, keeps the last 5 versions as
+  `pf.conf.bak-<timestamp>` next to it and is logged in
+  `/etc/omnitunnel/pf.log`. Removing a tunnel archives its forwards in
+  `/etc/omnitunnel/removed/`.
+- `pf-add` warns when another DNAT for the same port runs before this forward
+  (a higher-priority nat table, an earlier rule) or at the same priority in
+  another table. `pf-check` and `status` also report stale DNATs that point at
+  a dead tunnel and duplicates outside the instance's chain. They only report;
+  nothing is deleted.
 
 ---
 
@@ -346,7 +365,9 @@ omnitunnel server-token <token>      # paste on the foreign for the manual path
 omnitunnel list
 omnitunnel status  <instance>
 omnitunnel remove  <instance>        # removes ONLY that instance (both-side safe)
-omnitunnel pf-add  <instance> <tcp|udp|both> <port>
+omnitunnel pf-add  <instance> <tcp|udp|both> <port|public:target>[,...]
+omnitunnel pf-del  <instance> <port|public:target>[,...] [--force]
+omnitunnel pf-check <instance>
 omnitunnel forget-host <foreign_ip> [ssh_port]
 omnitunnel bench
 omnitunnel update                    # pull the latest from GitHub (see below)
