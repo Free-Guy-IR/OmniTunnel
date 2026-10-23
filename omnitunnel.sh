@@ -1430,6 +1430,7 @@ pf_is_private() {
     local LC_ALL=C
     [[ "$1" =~ ^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.) ]]
 }
+pf_have_ping() { command -v ping >/dev/null 2>&1; }
 pf_target_state() {
     local ip="${1%%:*}" r dev
     PF_TS="skip"
@@ -1444,6 +1445,7 @@ pf_target_state() {
     else
         dev="$(sed -n 's/.* dev \([^ ]*\).*/\1/p' <<< "$r")"
         if [[ -n "$dev" ]] && ! ip -o link show dev "$dev" 2>/dev/null | grep -q '[<,]UP[,>]'; then PF_TS="tunnel device $dev is down"
+        elif ! pf_have_ping; then PF_TS="skip"
         elif ping -c 2 -W 1 "$ip" >/dev/null 2>&1 </dev/null; then PF_TS="up"
         else PF_TS="$ip does not answer ping (dev ${dev:-?}) - its tunnel looks down"; fi
     fi
@@ -1524,10 +1526,14 @@ pf_check() {
     local n="$1" pf recs pr p tg rows pk peer tgt out loss rtt live
     pf="$(inst_pf "$n")"
     tgt="$PEER_ADDR"; type_is_hysteria "$TYPE" && tgt="$PEER_IP"
-    out="$(ping -c 3 -W 2 "$tgt" </dev/null 2>/dev/null || true)"
-    loss="$(grep -oE '[0-9]+% packet loss' <<< "$out" | grep -oE '^[0-9]+' || true)"
-    rtt="$(awk -F'/' '/rtt|round-trip/{print $5}' <<< "$out" || true)"
-    if [[ -n "$rtt" ]]; then live="alive - ping $tgt: rtt ${rtt} ms, loss ${loss:-0}%"; else live="DOWN - no ping reply from $tgt"; fi
+    if pf_have_ping; then
+        out="$(ping -c 3 -W 2 "$tgt" </dev/null 2>/dev/null || true)"
+        loss="$(grep -oE '[0-9]+% packet loss' <<< "$out" | grep -oE '^[0-9]+' || true)"
+        rtt="$(awk -F'/' '/rtt|round-trip/{print $5}' <<< "$out" || true)"
+        if [[ -n "$rtt" ]]; then live="alive - ping $tgt: rtt ${rtt} ms, loss ${loss:-0}%"; else live="DOWN - no ping reply from $tgt"; fi
+    else
+        rtt="n/a"; live="unknown - ping is not installed"
+    fi
     printf '  %b%s%b  %s %s, peer %s via %s\n' "$C_BOLD$C_WHITE" "$n" "$C_RESET" "$TYPE" "$ROLE" "$PEER_ADDR" "$DEV"
     printf '  tunnel: %s\n' "$live"
     PF_NPROB=0
