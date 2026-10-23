@@ -198,7 +198,7 @@ EOF
 sub="$(
     PF_IPT_NAMES="$WORK/legacy-names"
     nft() { return 1; }
-    iptables() { case "$1" in -V) echo "iptables v1.8.4 (legacy)";; esac; return 0; }
+    iptables() { [[ "$1" != -V ]] || echo "iptables v1.8.4 (legacy)"; return 0; }
     iptables-save() { [[ "$*" == "-c -t nat" ]] && cat "$WORK/legacy.save"; }
     recs="$(nat_scan 2>&1)"
     grep -qx -- '-100 [0-9]* legacy ip nat TSUITE_LEG PREROUTING tcp 400 dnat 10.201.2.2:400 9' <<< "$recs" || bad "C9 legacy iptables-save rules are not scanned with their counters: $(tr '\n' '|' <<< "$recs")"
