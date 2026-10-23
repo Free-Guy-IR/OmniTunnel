@@ -118,6 +118,12 @@ jobs:
           set -eo pipefail
           sudo bash tests/pf_forward_root_test.sh | tee /tmp/pf_forward_root_test.out
           grep -q '^PASSED - pf_forward_root_test' /tmp/pf_forward_root_test.out
+      - name: port-forward mapping test incl. hysteria relay units (root, private mount namespace)
+        run: |
+          set -eo pipefail
+          sudo bash tests/pf_map_test.sh | tee /tmp/pf_map_test.out
+          grep -q '^relay case: ran and passed' /tmp/pf_map_test.out
+          grep -q '^PASSED - pf_map_test' /tmp/pf_map_test.out
       - name: SSH pin-race test (root, real sshd)
         run: |
           set -eo pipefail
