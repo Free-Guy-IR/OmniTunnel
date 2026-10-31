@@ -17,7 +17,7 @@ extract() {
     }' "$SCRIPT"
 }
 
-eval "$(extract "tok_re lanes_ok inst_name_ok create_id_ok new_create_id inst_create_lock inst_create_unlock type_is_hysteria type_is_stripe type_is_ackless type_is_kernel type_is_revmux type_uses_key inst_path inst_conf inst_pf inst_exists list_instances validate_inst_name norm_port create_inst cmd_peercreate cmd_remove_own provision_peer peer_inst_state peer_remove_own gen_key")"
+eval "$(extract "tok_re lanes_ok inst_name_ok create_id_ok new_create_id inst_create_lock inst_create_unlock type_is_hysteria type_is_stripe type_is_ackless type_is_kernel type_is_revmux type_uses_key inst_path inst_conf inst_pf inst_exists list_instances validate_inst_name dnat_chain norm_port create_inst cmd_peercreate cmd_remove_own provision_peer peer_inst_state peer_remove_own gen_key")"
 eval "$(grep -m1 '^ALL_TYPES=' "$SCRIPT")"
 
 DISPATCH="$(grep -E '^[[:space:]]+(_peercreate|_remove_own|_remove)\)' "$SCRIPT")"

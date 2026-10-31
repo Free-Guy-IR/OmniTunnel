@@ -16,7 +16,7 @@ extract() {
     }' "$SCRIPT"
 }
 
-eval "$(extract "type_uses_key type_is_hysteria type_is_stripe type_is_ackless type_is_kernel type_is_revmux tok_re lanes_ok inst_name_ok type_known tok_host_ok tok_ipv4_ok tok_port_ok tok_nc_ok tok_hexkey_ok tok_key_ok tok_shape_ok tok_pmode_ok new_inst_lanes build_execstart load_inst create_inst validate_inst_name list_instances inst_path inst_conf inst_pf inst_exists manual_token cmd_server_token cmd_peercreate provision_peer cmd_add_auto cmd_add_manual add_parse alloc_and_create alloc_subnet alloc_port alloc_port_span next_port next_subnet_idx occupied_port_ranges remote_port_ranges peer_port_triples type_port_span port_base gen_key auto_name create_id_ok new_create_id inst_create_lock inst_create_unlock cmd_remove_own peer_inst_state peer_remove_own")"
+eval "$(extract "type_uses_key type_is_hysteria type_is_stripe type_is_ackless type_is_kernel type_is_revmux tok_re lanes_ok inst_name_ok type_known tok_host_ok tok_ipv4_ok tok_port_ok tok_nc_ok tok_hexkey_ok tok_key_ok tok_shape_ok tok_pmode_ok new_inst_lanes build_execstart load_inst create_inst validate_inst_name dnat_chain list_instances inst_path inst_conf inst_pf inst_exists manual_token cmd_server_token cmd_peercreate provision_peer cmd_add_auto cmd_add_manual add_parse alloc_and_create alloc_subnet alloc_port alloc_port_span next_port next_subnet_idx occupied_port_ranges remote_port_ranges peer_port_triples type_port_span port_base gen_key auto_name create_id_ok new_create_id inst_create_lock inst_create_unlock cmd_remove_own peer_inst_state peer_remove_own")"
 eval "$(grep -m1 '^ALL_TYPES=' "$SCRIPT")"
 eval "$(grep -m1 '^VERSION=' "$SCRIPT")"
 
