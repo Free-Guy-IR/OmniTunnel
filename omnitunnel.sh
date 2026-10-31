@@ -20,7 +20,7 @@
 # /etc/icmptun install (this tool never reads, edits or deletes that).
 set -euo pipefail
 
-VERSION="2.9.13"
+VERSION="2.9.14"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 
@@ -93,6 +93,7 @@ validate_inst_name() {
     inst_name_ok "$n" || die "instance name must start alphanumeric and contain only letters, digits, - or _ (got '$n')"
     for other in $(list_instances); do
         [[ "$other" == "$n" ]] && continue
+        [[ "$(dnat_chain "$n")" == "$(dnat_chain "$other")" ]] && die "name '$n' maps to the same iptables chain as existing instance '$other' - names that differ only by case or by - vs _ collide; pick another"
         case "$n" in
             "$other"-mux|"$other"-pf-*)
                 die "name '$n' would collide with a helper unit of instance '$other' - pick another name";;
@@ -978,7 +979,21 @@ inst_detail() {
 }
 
 # ------------------------------------------------------------- port fwd -------
-pf_apply_all() {
+with_pf_lock() {
+    local name="$1"; shift; local fd rc=0 key; key="$(dnat_chain "$name")"
+    if mkdir -p "$RUN_DIR" 2>/dev/null; then
+        chmod 700 "$RUN_DIR" 2>/dev/null || true
+        if exec {fd}>>"$RUN_DIR/pf.$key.lock"; then
+            chmod 600 "$RUN_DIR/pf.$key.lock" 2>/dev/null || true
+            if flock -w 30 "$fd"; then "$@" || rc=$?; else rc=1; fi
+            exec {fd}>&-
+            return "$rc"
+        fi
+    fi
+    "$@"
+}
+pf_apply_all() { with_pf_lock "$1" _pf_apply_all "$1"; }
+_pf_apply_all() {
     load_inst "$1"
     # hysteria forwards ports outside iptables: TCP via per-port relays (no engine
     # restart), UDP in-config (restart only if the UDP set changed).
@@ -986,17 +1001,46 @@ pf_apply_all() {
         hy_pf_reconcile "$1"
         return 0
     fi
-    local pf; pf="$(inst_pf "$1")"; [[ -f "$pf" ]] || return 0
+    local pf; pf="$(inst_pf "$1")"; [[ -s "$pf" ]] || { _pf_flush_chain "$1"; return 0; }
     local ch; ch="$(dnat_chain "$1")"
-    iptables -t nat -N "$ch" 2>/dev/null || true; iptables -t nat -F "$ch"
-    iptables -t nat -C PREROUTING -j "$ch" 2>/dev/null || iptables -t nat -I PREROUTING 1 -j "$ch"
-    iptables -t nat -C POSTROUTING -o "$DEV" -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o "$DEV" -j MASQUERADE
-    local proto port
+    ipt -t nat -N "$ch" 2>/dev/null || true; ipt -t nat -F "$ch"
+    ipt -t nat -C PREROUTING -j "$ch" 2>/dev/null || ipt -t nat -I PREROUTING 1 -j "$ch"
+    ipt -t nat -C POSTROUTING -o "$DEV" -j MASQUERADE 2>/dev/null || ipt -t nat -A POSTROUTING -o "$DEV" -j MASQUERADE
+    local proto port n=0
     while IFS=: read -r proto port; do [[ -z "$proto" ]] && continue
-        iptables -t nat -A "$ch" -p "$proto" --dport "$port" -j DNAT --to-destination "$PEER_ADDR:$port"; done < "$pf"
+        ipt -t nat -A "$ch" -p "$proto" --dport "$port" -j DNAT --to-destination "$PEER_ADDR:$port"; n=$((n + 1)); done < "$pf"
+    pf_fwd_apply "$1" "$ch" "$pf" "$n"
 }
-pf_add() {
-    need_root; load_inst "$1"; local proto="$2" ports="$3"
+ipt() { iptables -w 10 "$@"; }
+pf_fwd_apply() {
+    local name="$1" ch="$2" pf="$3" n="$4" ok=1 old i proto port at drop
+    if [[ "$n" -eq 0 ]]; then pf_fwd_drop "$ch"; return 0; fi
+    ipt -N "$ch" 2>/dev/null || true
+    old="$(ipt -S "$ch" 2>/dev/null | grep -c "^-A $ch " || true)"
+    while IFS=: read -r proto port; do [[ -z "$proto" ]] && continue
+        ipt -A "$ch" ! -i "$DEV" -o "$DEV" -d "$PEER_ADDR" -p "$proto" --dport "$port" -m conntrack --ctstate DNAT --ctdir ORIGINAL --ctorigdstport "$port" -j ACCEPT 2>/dev/null || ok=0
+        ipt -A "$ch" -i "$DEV" -s "$PEER_ADDR" -p "$proto" --sport "$port" -m conntrack --ctstate DNAT --ctdir REPLY --ctorigdstport "$port" -j ACCEPT 2>/dev/null || ok=0
+    done < "$pf"
+    ipt -A "$ch" -o "$DEV" -p icmp -m conntrack --ctstate RELATED --ctreplsrc "$PEER_ADDR" -m conntrack --ctstate DNAT -j ACCEPT 2>/dev/null || ok=0
+    ipt -A "$ch" -i "$DEV" -p icmp -m conntrack --ctstate RELATED --ctreplsrc "$PEER_ADDR" -m conntrack --ctstate DNAT -j ACCEPT 2>/dev/null || ok=0
+    for ((i = 0; i < 10#$old; i++)); do ipt -D "$ch" 1 2>/dev/null || break; done
+    ipt -C FORWARD -j "$ch" 2>/dev/null || ipt -A FORWARD -j "$ch" 2>/dev/null || ok=0
+    [[ "$ok" -eq 1 ]] || warn "could not allow '$name' forwards in FORWARD; a DROP forward policy (Docker, ufw) will block them"
+    at="$(ipt -S FORWARD 2>/dev/null | grep -nxF -- "-A FORWARD -j $ch" | head -n1 | cut -d: -f1 || true)"
+    drop="$(ipt -S FORWARD 2>/dev/null | grep -nxE -- '-A FORWARD -j (DROP|REJECT)( .*)?' | head -n1 | cut -d: -f1 || true)"
+    if [[ -n "$at" && -n "$drop" ]] && (( 10#$drop < 10#$at )); then
+        warn "FORWARD has an unconditional DROP/REJECT above '$ch'; '$name' forwards stay blocked until '-j $ch' is placed above it"
+    fi
+    return 0
+}
+pf_fwd_drop() {
+    local ch="$1" i
+    for ((i = 0; i < 64; i++)); do ipt -D FORWARD -j "$ch" 2>/dev/null || break; done
+    ipt -F "$ch" 2>/dev/null || true; ipt -X "$ch" 2>/dev/null || true
+}
+pf_add() { need_root; load_inst "$1"; with_pf_lock "$1" _pf_add "$@"; }
+_pf_add() {
+    local proto="$2" ports="$3"
     [[ "$proto" =~ ^(tcp|udp|both)$ ]] || die "proto must be tcp|udp|both"
     # accept several ports at once, comma-separated: pf-add <inst> tcp 8080,8081,700
     local pf pr p np rc; pf="$(inst_pf "$1")"
@@ -1008,10 +1052,11 @@ pf_add() {
             [[ "$rc" -le 1 ]] || die "could not read $pf (grep exit $rc) - nothing added"
             [[ "$rc" -eq 0 ]] || echo "$pr:$np" >> "$pf"; done
     done
-    pf_apply_all "$1"; ok "forwarding $proto/$ports through '$1' to $PEER_ADDR"
+    _pf_apply_all "$1"; ok "forwarding $proto/$ports through '$1' to $PEER_ADDR"
 }
-pf_del() {
-    need_root; load_inst "$1"; local ports="$2" pf p np; pf="$(inst_pf "$1")"
+pf_del() { need_root; load_inst "$1"; with_pf_lock "$1" _pf_del "$@"; }
+_pf_del() {
+    local ports="$2" pf p np; pf="$(inst_pf "$1")"
     # accept several ports at once, comma-separated: pf-del <inst> 8080,8081
     if [[ -f "$pf" ]]; then
         for p in ${ports//,/ }; do
@@ -1019,13 +1064,15 @@ pf_del() {
             rewrite_without "$pf" ":0*$np\$" || die "could not rewrite $pf - nothing removed"
         done
     fi
-    pf_apply_all "$1"; ok "removed forward(s) on port(s) $ports from '$1'"
+    _pf_apply_all "$1"; ok "removed forward(s) on port(s) $ports from '$1'"
 }
-pf_flush_chain() {
+pf_flush_chain() { with_pf_lock "$1" _pf_flush_chain "$1"; }
+_pf_flush_chain() {
     load_inst "$1" 2>/dev/null || return 0; local ch; ch="$(dnat_chain "$1")"
-    iptables -t nat -D PREROUTING -j "$ch" 2>/dev/null || true
-    iptables -t nat -F "$ch" 2>/dev/null || true; iptables -t nat -X "$ch" 2>/dev/null || true
-    iptables -t nat -D POSTROUTING -o "$DEV" -j MASQUERADE 2>/dev/null || true
+    ipt -t nat -D PREROUTING -j "$ch" 2>/dev/null || true
+    ipt -t nat -F "$ch" 2>/dev/null || true; ipt -t nat -X "$ch" 2>/dev/null || true
+    ipt -t nat -D POSTROUTING -o "$DEV" -j MASQUERADE 2>/dev/null || true
+    pf_fwd_drop "$ch"
 }
 
 # ------------------------------------------------------------- mux (chisel) ---
@@ -1247,10 +1294,15 @@ inst_remove() {
     rm -f "/etc/systemd/system/$(svc_name "$1")"
     systemctl reset-failed "$(svc_name "$1")" 2>/dev/null || true   # no lingering 'not-found failed' ghost
     systemctl daemon-reload 2>/dev/null || true
-    pf_flush_chain "$1"; ip link del "$DEV" 2>/dev/null || true
-    inst_cleanup_residue "$DEV"
-    inst_nft_cleanup "$1" "$DEV"
-    rm -rf "$(inst_path "$1")"; ok "removed instance '$1'"
+    with_pf_lock "$1" _inst_remove_fwd "$1" "$DEV"
+    ok "removed instance '$1'"
+}
+_inst_remove_fwd() {
+    local n="$1" dev="$2"
+    _pf_flush_chain "$n"; ip link del "$dev" 2>/dev/null || true
+    inst_cleanup_residue "$dev"
+    inst_nft_cleanup "$n" "$dev"
+    rm -rf "$(inst_path "$n")"
 }
 
 # User-facing removal. For a CLIENT tunnel it removes the FAR (foreign) side FIRST
@@ -1993,7 +2045,7 @@ wizard_add_manual() {
 bench_ensure_iperf() {
     local h="$1" i
     # fast path: already listening
-    peer_ssh "$h" "timeout 12 sh -c 'ss -lntu 2>/dev/null | grep -q :5599'" && return 0
+    peer_ssh "$h" "timeout 12 sh -c 'ss -lntu 2>/dev/null | grep -qw 5599'" && return 0
     # install iperf3 if missing - HARD-BOUNDED so a held dpkg lock or a slow/broken
     # mirror can never hang the benchmark for hours (it used to). Non-interactive,
     # gives up on the lock after 30s and on the whole step after 100s.
@@ -2002,10 +2054,10 @@ bench_ensure_iperf() {
     for i in 1 2 3; do
         peer_ssh "$h" "timeout 15 sh -c '
             command -v iperf3 >/dev/null 2>&1 || exit 3
-            ss -lntu 2>/dev/null | grep -q :5599 && exit 0
+            ss -lntu 2>/dev/null | grep -qw 5599 && exit 0
             systemctl reset-failed tsbench-iperf 2>/dev/null
             systemd-run --unit=tsbench-iperf --collect iperf3 -s -p 5599 >/dev/null 2>&1 || (setsid iperf3 -s -p 5599 >/dev/null 2>&1 </dev/null &)
-            sleep 1; ss -lntu 2>/dev/null | grep -q :5599'" && return 0
+            sleep 1; ss -lntu 2>/dev/null | grep -qw 5599'" && return 0
         sleep 1
     done
     return 1
@@ -2547,10 +2599,13 @@ cmd_uninstall() {
     systemctl reset-failed 2>/dev/null || true; systemctl daemon-reload 2>/dev/null || true
     # 3) sweep any leftover TSUITE nat chains
     local ch
-    for ch in $(iptables -t nat -S 2>/dev/null | grep -oE 'TSUITE_[A-Z0-9_]+' | sort -u); do
-        iptables -t nat -D PREROUTING -j "$ch" 2>/dev/null || true
-        iptables -t nat -F "$ch" 2>/dev/null || true
-        iptables -t nat -X "$ch" 2>/dev/null || true
+    for ch in $(ipt -t nat -S 2>/dev/null | grep -oE 'TSUITE_[A-Z0-9_]+' | sort -u); do
+        ipt -t nat -D PREROUTING -j "$ch" 2>/dev/null || true
+        ipt -t nat -F "$ch" 2>/dev/null || true
+        ipt -t nat -X "$ch" 2>/dev/null || true
+    done
+    for ch in $(ipt -S 2>/dev/null | grep -oE 'TSUITE_[A-Z0-9_]+' | sort -u); do
+        pf_fwd_drop "$ch"
     done
     # 4) core binaries + relay helper
     rm -f "$TSUITE_BIN" "$HYSTERIA_BIN" "$HY_RELAY" "$FWD_SYSCTL_FILE"
