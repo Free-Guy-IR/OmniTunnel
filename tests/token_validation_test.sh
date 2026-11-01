@@ -15,7 +15,7 @@ extract() {
     }' "$SCRIPT"
 }
 
-eval "$(extract "type_uses_key type_is_hysteria type_is_stripe type_is_ackless type_is_kernel type_is_revmux tok_re lanes_ok inst_name_ok type_known tok_host_ok tok_ipv4_ok tok_port_ok tok_nc_ok tok_hexkey_ok tok_key_ok tok_shape_ok tok_pmode_ok mux_map_ok norm_port validate_inst_name dnat_chain list_instances inst_path inst_conf inst_pf inst_exists create_inst load_inst manual_token gen_key mux_conf mux_ctrl_port mux_token cmd_mux_add cmd_mux_token cmd_server_token cmd_bench_server _bench_key_for")"
+eval "$(extract "type_uses_key type_is_hysteria type_is_stripe type_is_ackless type_is_kernel type_is_revmux tok_re lanes_ok inst_name_ok type_known tok_host_ok tok_ipv4_ok tok_port_ok tok_nc_ok tok_hexkey_ok tok_key_ok tok_shape_ok tok_pmode_ok mux_map_ok norm_port validate_inst_name list_instances inst_path inst_conf inst_pf inst_exists create_inst load_inst manual_token gen_key mux_conf mux_ctrl_port mux_token cmd_mux_add cmd_mux_token cmd_server_token cmd_bench_server _bench_key_for")"
 eval "$(grep -m1 '^ALL_TYPES=' "$SCRIPT")"
 BENCH_FMT="$(sed -nE "s/.*token=\\\$\(printf '(bench[^']*)'.*/\1/p" "$SCRIPT" | head -1)"
 

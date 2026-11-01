@@ -35,7 +35,7 @@ extract() {
     }' "$SCRIPT"
 }
 
-eval "$(extract "tok_re inst_name_ok list_instances inst_path inst_conf inst_pf inst_exists svc_name dnat_chain mux_svc mux_remove load_inst create_inst validate_inst_name type_is_hysteria with_pf_lock _pf_flush_chain pf_flush_chain ipt pf_fwd_drop inst_cleanup_residue inst_remove apply_tuning with_mangle_lock nft_mangle_state mss_clamp_rules mss_clamp_add mangle_release inst_sdev_shared inst_nft_cleanup")"
+eval "$(extract "tok_re inst_name_ok list_instances inst_path inst_conf inst_pf inst_exists svc_name dnat_chain mux_svc mux_remove load_inst create_inst validate_inst_name type_is_hysteria with_pf_lock _pf_flush_chain pf_flush_chain ipt pf_fwd_drop inst_cleanup_residue _inst_remove_fwd inst_remove apply_tuning with_mangle_lock nft_mangle_state mss_clamp_rules mss_clamp_add mangle_release inst_sdev_shared inst_nft_cleanup")"
 
 ok() { :; }
 warn() { :; }

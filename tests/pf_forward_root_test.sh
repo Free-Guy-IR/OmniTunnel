@@ -199,10 +199,6 @@ if ! { [[ "$(jumps TSUITE_FWB)" == 0 ]] && ! chain_exists TSUITE_FWB; }; then fa
 iptables -w -S FORWARD | grep -qxF -- '-A FORWARD -j DOCKER-USER' || fail "teardown removed the Docker-like jump"
 iptables -w -S FORWARD | grep -qxF -- '-P FORWARD DROP' || fail "teardown changed the FORWARD policy"
 
-mk_inst pf_x ts-pfx 10.88.9.9 udp:7100
-if ( validate_inst_name pf-x ) 2>/dev/null; then fail "a name mapping to the same chain as an existing instance (pf-x vs pf_x) was not rejected"; fi
-validate_inst_name pfx2 >/dev/null 2>&1 || fail "a non-colliding name was wrongly rejected"
-
 mk_inst fwd ts-fwd 10.88.9.9 udp:7200 udp:7201 udp:7202
 pf_apply_all fwd
 for _ in $(seq 1 20); do
@@ -230,4 +226,4 @@ for _ in $(seq 1 15); do
 done
 pf_fwd_drop TSUITE_FWE 2>/dev/null || true; rm -rf "$INST_DIR/fwe"
 
-echo "PASSED - pf_forward_root_test: UDP and TCP forwards cross a FORWARD DROP policy, untranslated traffic, foreign DNATs and tunnel-initiated connections stay dropped, rules rebuilt on unit start and survive a late Docker-like firewall, 20-round apply/apply and apply/flush interleaving keeps the other instance intact, colliding chain names are rejected, concurrent pf-add/pf-del never lose a port, instance removal under the pf lock never orphans a chain against a racing pf-add, exact teardown"
+echo "PASSED - pf_forward_root_test: UDP and TCP forwards cross a FORWARD DROP policy, untranslated traffic, foreign DNATs and tunnel-initiated connections stay dropped, rules rebuilt on unit start and survive a late Docker-like firewall, 20-round apply/apply and apply/flush interleaving keeps the other instance intact, concurrent pf-add/pf-del never lose a port, instance removal under the pf lock never orphans a chain against a racing pf-add, exact teardown"

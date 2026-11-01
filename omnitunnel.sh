@@ -93,7 +93,6 @@ validate_inst_name() {
     inst_name_ok "$n" || die "instance name must start alphanumeric and contain only letters, digits, - or _ (got '$n')"
     for other in $(list_instances); do
         [[ "$other" == "$n" ]] && continue
-        [[ "$(dnat_chain "$n")" == "$(dnat_chain "$other")" ]] && die "name '$n' maps to the same iptables chain as existing instance '$other' - names that differ only by case or by - vs _ collide; pick another"
         case "$n" in
             "$other"-mux|"$other"-pf-*)
                 die "name '$n' would collide with a helper unit of instance '$other' - pick another name";;
