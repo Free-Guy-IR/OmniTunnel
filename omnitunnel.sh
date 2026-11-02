@@ -1021,9 +1021,8 @@ pf_entries() {
 pf_spec_parse() {
     local LC_ALL=C item a b items=()
     PF_SPEC=()
-    IFS=, read -r -a items <<< "$1"
+    IFS=$', \t\n' read -r -a items <<< "$1"
     for item in ${items[@]+"${items[@]}"}; do
-        item="${item//[[:space:]]/}"
         [[ -n "$item" ]] || continue
         if [[ "$item" =~ ^([0-9]{1,5}):([0-9]{1,5})$ ]]; then
             a="${BASH_REMATCH[1]}"; b="${BASH_REMATCH[2]}"
@@ -1039,10 +1038,12 @@ pf_spec_parse() {
     return 0
 }
 pf_log() {
-    local f="$ROOT_DIR/pf.log" sz
+    local f="$ROOT_DIR/pf.log" sz fd=""
+    { exec {fd}>>"$ROOT_DIR/.pf.log.lock" && flock -w 10 "$fd"; } 2>/dev/null || true
     sz="$(stat -c %s "$f" 2>/dev/null || echo 0)"
     [[ "$sz" =~ ^[0-9]+$ && "$sz" -gt 1048576 ]] && mv -f "$f" "$f.1" 2>/dev/null
     ( umask 077; printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >> "$f" ) 2>/dev/null || true
+    if [[ -n "$fd" ]]; then exec {fd}>&-; fi
     if command -v logger >/dev/null 2>&1; then logger -t omnitunnel -- "pf: $*" 2>/dev/null || true; fi
     return 0
 }
@@ -1066,8 +1067,8 @@ pf_write() {
     t="$(mktemp "$d/.pf.conf.XXXXXX" 2>/dev/null)" || die "cannot create a temp file in $d - nothing changed"
     if ! cat > "$t"; then rm -f "$t"; die "could not write the new forward list of '$n' - nothing changed"; fi
     if [[ -f "$pf" ]] && cmp -s "$t" "$pf"; then rm -f "$t"; return 0; fi
-    on="$(grep -c . "$pf" 2>/dev/null || true)"; on="${on:-0}"
-    nn="$(grep -c . "$t" 2>/dev/null || true)"; nn="${nn:-0}"
+    on="$(pf_entries "$pf" | grep -c . || true)"; on="${on:-0}"
+    nn="$(pf_entries "$t" | grep -c . || true)"; nn="${nn:-0}"
     if [[ "$on" -gt 0 && "$nn" -eq 0 && "${PF_FORCE:-0}" != 1 ]]; then
         rm -f "$t"
         pf_log "$n $act REFUSED: it would remove the last $on forward line(s)"
@@ -2438,10 +2439,11 @@ cmd_server_token() {
     # not, so the token stays retryable.
     if inst_exists "$name"; then
         load_inst "$name"
-        if [[ "$ROLE" != server || -s "$(inst_pf "$name")" ]]; then
-            die "an instance named '$name' already exists on this box as a $ROLE$([[ -s "$(inst_pf "$name")" ]] && printf ' with port forwards') - refusing to replace it with this token; remove it first if that is really intended"
+        if [[ -n "$ROLE" && "$ROLE" != server ]] || [[ -n "$(pf_entries "$(inst_pf "$name")")" ]]; then
+            die "an instance named '$name' already exists on this box as a ${ROLE:-instance}$([[ -n "$(pf_entries "$(inst_pf "$name")")" ]] && printf ' with port forwards') - refusing to replace it with this token; remove it first if that is really intended"
         fi
         warn "instance '$name' already exists - replacing it"; inst_remove "$name" >/dev/null 2>&1 || true
+        inst_exists "$name" && die "could not remove the old instance '$name' (another omnitunnel run may hold its port-forward lock) - run the token again"
     fi
     create_inst "$name" "$t" server "$fhost" "$mylip" "$port" "$key" "$pta" "$ppa" "$shape" "$nc" "$pmode" "" "$lanes"
     inst_enable "$name"
@@ -2789,7 +2791,7 @@ bench_run() {
     local bid="$BENCH_ID"
     bench_clean_abandoned "$fhost" || true
     echo; printf "%b\n" "${C_BOLD}Benchmarking each tunnel (a few minutes)...${C_RESET}"
-    local rows=() base; base=$(next_subnet_idx); local i=0 t
+    local rows=() base taken=" "; base=$(next_subnet_idx); local i=0 t
     # Best-effort measurement: one tunnel failing (a ping with no reply, an iperf
     # that times out, a far-side bring-up hiccup) must NOT abort the whole run
     # under 'set -e'. Relax it for the loop; each type just records FAIL instead.
@@ -2798,7 +2800,7 @@ bench_run() {
         local name="bench-$t" sub=$((base+i)) pft; i=$((i+1))
         local ta="10.201.$sub.1" pa="10.201.$sub.2" port key nc=8 shape=none
         if inst_exists "$name"; then
-            rows+=("$t|FAIL|FAIL|100%|n/a"); echo "  $t ... FAIL (a local instance named '$name' already exists - remove it, or run: omnitunnel bench-clean)"; continue
+            taken+="$name "; rows+=("$t|FAIL|FAIL|100%|n/a"); echo "  $t ... FAIL (a local instance named '$name' already exists - remove it, or run: omnitunnel bench-clean)"; continue
         fi
         port=$(next_port $(( $(port_base "$t") + sub )) "$t"); key=$(gen_key)
         type_uses_key "$t" || key=""
@@ -2881,7 +2883,7 @@ bench_run() {
     done
     # belt-and-braces: make sure no bench-* survived on either side
     for t in $ALL_TYPES; do
-        inst_exists "bench-$t" && inst_remove "bench-$t" >/dev/null 2>&1 || true
+        if [[ "$taken" != *" bench-$t "* ]]; then inst_exists "bench-$t" && inst_remove "bench-$t" >/dev/null 2>&1 || true; fi
         bench_peer_remove "$fhost" "$bid" "bench-$t"
     done
     # tear down the foreign measurement helpers (iperf + curl file server)
@@ -3023,6 +3025,9 @@ cmd_bench_server() {
         local name="bench-$t" sub=$((100+i)) port=$((51900+i)) key; key=$(_bench_key_for "$t")
         local ta="10.201.$sub.1" pa="10.201.$sub.2"
         inst_exists "$name" && inst_remove "$name" >/dev/null 2>&1
+        if inst_exists "$name"; then
+            warn "could not replace the old benchmark instance '$name' - skipping $t"; i=$((i+1)); continue
+        fi
         create_inst "$name" "$t" server "$fhost" "$mylip" "$port" "$key" "$pa" "$ta" none 8
         inst_enable "$name" >/dev/null 2>&1
         i=$((i+1))
@@ -3183,17 +3188,21 @@ pick_fwd_port() {
 
 pf_confirm_del() {
     local n="$1" p="$2" pf x hit=() total=0 yn
+    PF_DEL_LAST=0
     pf="$(inst_pf "$n")"
     if [[ -f "$pf" ]]; then
         while IFS= read -r x || [[ -n "$x" ]]; do
-            [[ -n "$x" ]] || continue
+            pf_line_parse "$x" || continue
             total=$((total+1))
-            if pf_line_parse "$x" && [[ "$PF_PUB" == "$p" ]]; then hit+=("$x"); fi
+            if [[ "$PF_PUB" == "$p" ]]; then hit+=("$x"); fi
         done < "$pf"
     fi
     [[ ${#hit[@]} -gt 0 ]] || { warn "'$n' has no forward on port $p"; return 1; }
     printf '  %bremove from tunnel %s:%b %s\n' "$C_BYEL" "$n" "$C_RESET" "${hit[*]}"
-    [[ ${#hit[@]} -lt $total ]] || warn "these are the LAST forwards of '$n' - it will forward nothing afterwards"
+    if [[ ${#hit[@]} -ge $total ]]; then
+        PF_DEL_LAST=1
+        warn "these are the LAST forwards of '$n' - it will forward nothing afterwards"
+    fi
     read -erp "  Remove them? [y/N]: " yn || true
     [[ "$yn" =~ ^[Yy]([Ee][Ss])?$ ]]
 }
@@ -3387,7 +3396,7 @@ menu_pf() {
             2) if pick_instance; then n="$PICK"
                  if pick_fwd_port "$n"; then
                      if [[ "$PORT_KIND" == mux ]]; then cmd_mux_del "$n" "$PORT_PICK"
-                     elif pf_confirm_del "$n" "$PORT_PICK"; then ( PF_FORCE=1; pf_del "$n" "$PORT_PICK" ) || true
+                     elif pf_confirm_del "$n" "$PORT_PICK"; then ( if [[ "$PF_DEL_LAST" == 1 ]]; then PF_FORCE=1; fi; pf_del "$n" "$PORT_PICK" ) || true
                      else info "nothing removed"; fi
                  fi
                fi; pause;;
