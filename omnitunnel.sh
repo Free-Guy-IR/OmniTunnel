@@ -990,7 +990,7 @@ with_pf_lock() {
         chmod 700 "$RUN_DIR" 2>/dev/null || true
         if exec {fd}>>"$RUN_DIR/pf.$key.lock"; then
             chmod 600 "$RUN_DIR/pf.$key.lock" 2>/dev/null || true
-            if flock -w 30 "$fd"; then "$@" || rc=$?; else warn "timed out waiting for the port-forward lock of '$name' (another omnitunnel run holds it) - nothing changed"; rc=1; fi
+            if flock -w "${PF_LOCK_WAIT:-30}" "$fd"; then "$@" || rc=$?; else warn "timed out waiting for the port-forward lock of '$name' (another omnitunnel run holds it) - nothing changed"; rc=1; fi
             exec {fd}>&-
             return "$rc"
         fi
@@ -1021,7 +1021,7 @@ pf_entries() {
 pf_spec_parse() {
     local LC_ALL=C item a b items=()
     PF_SPEC=()
-    IFS=$', \t\n' read -r -a items <<< "$1"
+    IFS=$', \t\n' read -r -d '' -a items <<< "$1" || true
     for item in ${items[@]+"${items[@]}"}; do
         [[ -n "$item" ]] || continue
         if [[ "$item" =~ ^([0-9]{1,5}):([0-9]{1,5})$ ]]; then
@@ -1029,10 +1029,10 @@ pf_spec_parse() {
         elif [[ "$item" =~ ^[0-9]{1,5}$ ]]; then
             a="$item"; b=""
         else
-            warn "skipping invalid port '$item' (use <port> or <public>:<target>)"; continue
+            die "invalid port '$item' in '$1' (use <port> or <public>:<target>, comma-separated) - nothing changed"
         fi
-        a="$(norm_port "$a")" || { warn "skipping invalid port '$item' (ports are 1-65535)"; continue; }
-        if [[ -n "$b" ]]; then b="$(norm_port "$b")" || { warn "skipping invalid port '$item' (ports are 1-65535)"; continue; }; fi
+        a="$(norm_port "$a")" || die "invalid port '$item' in '$1' (ports are 1-65535) - nothing changed"
+        if [[ -n "$b" ]]; then b="$(norm_port "$b")" || die "invalid port '$item' in '$1' (ports are 1-65535) - nothing changed"; fi
         PF_SPEC+=("$a${b:+ $b}")
     done
     return 0
@@ -1072,7 +1072,7 @@ pf_write() {
     if [[ "$on" -gt 0 && "$nn" -eq 0 && "${PF_FORCE:-0}" != 1 ]]; then
         rm -f "$t"
         pf_log "$n $act REFUSED: it would remove the last $on forward line(s)"
-        die "this would remove the LAST forward(s) of '$n' and leave it forwarding nothing - nothing changed. Re-run with --force if that is really what you want"
+        die "this would remove the LAST forward(s) in the pf.conf of '$n' - nothing changed. Re-run with --force if that is really what you want"
     fi
     if ! pf_backup "$n"; then rm -f "$t"; die "could not back up $pf - nothing changed"; fi
     chmod 600 "$t" 2>/dev/null || true
@@ -1194,6 +1194,9 @@ _pf_del() {
         fi
         if [[ "$drop" == 1 ]]; then dropped+=("$x"); else keep+=("$x"); fi
     done
+    if [[ -n "${PF_EXPECT:-}" && "$(printf '%s\n' ${dropped[@]+"${dropped[@]}"} | sort)" != "$PF_EXPECT" ]]; then
+        die "the forwards on port(s) $spec of '$n' changed while you were confirming - nothing removed"
+    fi
     if [[ ${#dropped[@]} -eq 0 ]]; then
         warn "no forward on port(s) $spec in '$n' - nothing removed"; return 0
     fi
@@ -1771,17 +1774,19 @@ inst_nft_cleanup() {
 inst_remove() {
     need_root; inst_exists "$1" || { warn "no such instance: $1"; return 0; }
     load_inst "$1"
-    type_is_hysteria "$TYPE" && hy_remove_relays "$1"
-    mux_remove "$1"   # tear down any chisel mux server/client for this instance
-    systemctl disable --now "$(svc_name "$1")" >/dev/null 2>&1 || true
-    rm -f "/etc/systemd/system/$(svc_name "$1")"
-    systemctl reset-failed "$(svc_name "$1")" 2>/dev/null || true   # no lingering 'not-found failed' ghost
-    systemctl daemon-reload 2>/dev/null || true
-    with_pf_lock "$1" _inst_remove_fwd "$1" "$DEV"
+    with_pf_lock "$1" _inst_remove_fwd "$1" || { warn "instance '$1' was not removed"; return 1; }
     ok "removed instance '$1'"
 }
 _inst_remove_fwd() {
-    local n="$1" dev="$2"
+    local n="$1" dev
+    inst_exists "$n" || return 0
+    load_inst "$n"; dev="$DEV"
+    type_is_hysteria "$TYPE" && hy_remove_relays "$n"
+    mux_remove "$n"   # tear down any chisel mux server/client for this instance
+    systemctl disable --now "$(svc_name "$n")" >/dev/null 2>&1 || true
+    rm -f "/etc/systemd/system/$(svc_name "$n")"
+    systemctl reset-failed "$(svc_name "$n")" 2>/dev/null || true   # no lingering 'not-found failed' ghost
+    systemctl daemon-reload 2>/dev/null || true
     _pf_flush_chain "$n"; ip link del "$dev" 2>/dev/null || true
     inst_cleanup_residue "$dev"
     inst_nft_cleanup "$n" "$dev"
@@ -2892,7 +2897,12 @@ bench_run() {
     bench_run_done "$fhost"
 
     ROWS=("${rows[@]}"); RAW_DL="${raw_dl:-n/a}"; RAW_UL="${raw_ul:-n/a}"; RAW_PING="${raw_ping:-n/a}"; bench_table
-    printf '  %bevery test tunnel was removed from both sides.%b\n\n' "$C_GREY" "$C_RESET"
+    if [[ "$taken" == " " ]]; then
+        printf '  %bevery test tunnel was removed from both sides.%b\n\n' "$C_GREY" "$C_RESET"
+    else
+        warn "these local instances existed before this run and were left untouched:$taken- if they are leftovers of an interrupted benchmark, remove them with: omnitunnel bench-clean"
+        echo
+    fi
     rule_green
     printf '  %bKeep one as a permanent instance?%b ' "$C_BGRN" "$C_RESET"
     local ci=1 ch keep; for t in $ALL_TYPES; do printf "  %2d) %-12s %s\n" "$ci" "$t" "$(type_desc "$t")"; ci=$((ci+1)); done
@@ -3188,7 +3198,7 @@ pick_fwd_port() {
 
 pf_confirm_del() {
     local n="$1" p="$2" pf x hit=() total=0 yn
-    PF_DEL_LAST=0
+    PF_DEL_LAST=0; PF_DEL_SHOWN=""
     pf="$(inst_pf "$n")"
     if [[ -f "$pf" ]]; then
         while IFS= read -r x || [[ -n "$x" ]]; do
@@ -3199,9 +3209,10 @@ pf_confirm_del() {
     fi
     [[ ${#hit[@]} -gt 0 ]] || { warn "'$n' has no forward on port $p"; return 1; }
     printf '  %bremove from tunnel %s:%b %s\n' "$C_BYEL" "$n" "$C_RESET" "${hit[*]}"
+    PF_DEL_SHOWN="$(printf '%s\n' "${hit[@]}" | sort)"
     if [[ ${#hit[@]} -ge $total ]]; then
         PF_DEL_LAST=1
-        warn "these are the LAST forwards of '$n' - it will forward nothing afterwards"
+        warn "these are the LAST forwards in the pf.conf of '$n' - none will be left there afterwards"
     fi
     read -erp "  Remove them? [y/N]: " yn || true
     [[ "$yn" =~ ^[Yy]([Ee][Ss])?$ ]]
@@ -3396,7 +3407,7 @@ menu_pf() {
             2) if pick_instance; then n="$PICK"
                  if pick_fwd_port "$n"; then
                      if [[ "$PORT_KIND" == mux ]]; then cmd_mux_del "$n" "$PORT_PICK"
-                     elif pf_confirm_del "$n" "$PORT_PICK"; then ( if [[ "$PF_DEL_LAST" == 1 ]]; then PF_FORCE=1; fi; pf_del "$n" "$PORT_PICK" ) || true
+                     elif pf_confirm_del "$n" "$PORT_PICK"; then ( PF_EXPECT="$PF_DEL_SHOWN"; if [[ "$PF_DEL_LAST" == 1 ]]; then PF_FORCE=1; fi; pf_del "$n" "$PORT_PICK" ) || true
                      else info "nothing removed"; fi
                  fi
                fi; pause;;
