@@ -340,7 +340,7 @@ or use the **Port forwarding** menu (it lists mapped forwards as
 `4702 -> peer port 702` and asks before it removes anything).
 
 - `pf.conf` keeps the old `proto:port` lines for plain forwards and adds
-  `proto:public:target` lines for mapped ones. Managers older than v2.9.14 do
+  `proto:public:target` lines for mapped ones. Managers older than v2.9.15 do
   not understand the mapped form, so do not downgrade a box that has mapped
   forwards.
 - Every change replaces `pf.conf` atomically, keeps the last 5 versions as
