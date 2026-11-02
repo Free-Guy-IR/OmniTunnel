@@ -161,6 +161,10 @@ sub="$(
     pf_del() { printf 'tcp:443\n' > "$INST_DIR/$1/pf.conf"; _real_pf_del "$@"; }
     ( set -euo pipefail; menu_pf <<< $'2\n1\n1\ny\n\n0\n' ) >/dev/null 2>&1
     [[ "$(pfc race)" == "tcp:443" ]] || bad "S10 a TUI removal confirmed while it was NOT the last forward emptied the instance after a concurrent pf-del made it the last (pf.conf now [$(pfc race | tr '\n' ' ')])"
+    mk_inst solo client 22 'tcp:443\n'
+    pf_del() { printf 'tcp:443\nudp:443\n' > "$INST_DIR/$1/pf.conf"; _real_pf_del "$@"; }
+    ( set -euo pipefail; menu_pf <<< $'2\n2\n1\ny\n\n0\n' ) >/dev/null 2>&1
+    [[ "$(pfc solo)" == "$(printf 'tcp:443\nudp:443')" ]] || bad "S10 a TUI removal deleted a forward added on the same port while the operator was confirming (pf.conf now [$(pfc solo | tr '\n' ' ')])"
 )"
 [[ -z "$sub" ]] || printf '%s\n' "$sub"
 FAILS=$((FAILS + $(grep -c '^FAIL:' <<< "$sub")))
@@ -190,8 +194,15 @@ tok="$(printf 'half|gre|203.0.113.9|1.2.3.4|51830||10.201.32.2|10.201.32.1|none|
 [[ $rc -eq 0 ]] || bad "S7 re-running a token over a half-written instance (no ROLE, no forwards) is refused (rc=$rc) - the token is no longer retryable"
 mk_inst stuck server 33 ''
 tok="$(printf 'stuck|gre|203.0.113.9|1.2.3.4|51831||10.201.33.2|10.201.33.1|none|16||1' | base64 | tr -d '\n')"
-out="$( inst_remove() { :; }; ( set -euo pipefail; cmd_server_token "$tok" ) 2>&1 )"; rc=$?
+mkdir -p "$RUN_DIR"; : > "$WORK/hold"; rm -f "$WORK/held"
+( exec {h}>>"$RUN_DIR/pf.TSUITE_STUCK.lock"; flock "$h"; : > "$WORK/held"; while [[ -e "$WORK/hold" ]]; do sleep 0.05; done ) &
+holder=$!
+n=0; while [[ ! -e "$WORK/held" && $n -lt 400 ]]; do sleep 0.01; n=$((n+1)); done
+out="$( PF_LOCK_WAIT=1; systemctl() { printf '%s\n' "$*" >> "$WORK/s7d.sys"; }; ( set -euo pipefail; cmd_server_token "$tok" ) 2>&1 )"; rc=$?
+rm -f "$WORK/hold"; wait "$holder" 2>/dev/null
 [[ $rc -ne 0 ]] && grep -q "could not remove the old instance 'stuck'" <<< "$out" || bad "S7 a token whose old instance could not be removed (pf lock busy) does not say so: rc=$rc [$(tail -n1 <<< "$out")]"
+[[ -f "$INST_DIR/stuck/instance.conf" ]] || bad "S7 the old instance's config was removed although its removal could not take the pf lock"
+grep -q 'disable --now omnitun-stuck' "$WORK/s7d.sys" 2>/dev/null && bad "S7 the old instance was stopped and disabled before its removal could take the pf lock - the tunnel is left down"
 
 mk_inst "bench-$bt" server 34 'tcp:7100\n'
 pbefore="$(pfc "bench-$bt")"
@@ -226,6 +237,8 @@ out="$(
 )"
 [[ -d "$INST_DIR/bench-$bt" && "$(pfc "bench-$bt")" == "$pbefore" ]] || bad "S11 the SSH benchmark said it skipped the existing local bench-$bt and then removed it in its cleanup: $(tail -n2 <<< "$out" | tr '\n' ' ')"
 grep -q "bench-$bt' already exists" <<< "$out" || bad "S11 the SSH benchmark did not report the existing local bench-$bt"
+grep -q "existed before this run and were left untouched: bench-$bt" <<< "$out" || bad "S11 the SSH benchmark's closing message does not say it left bench-$bt in place"
+grep -q 'every test tunnel was removed from both sides' <<< "$out" && bad "S11 the SSH benchmark claims every test tunnel was removed although it left bench-$bt"
 
 if [[ "$FAILS" -ne 0 ]]; then echo "pf_safety_test: $FAILS failure(s)"; exit 1; fi
 echo "PASSED - pf_safety_test: last-forward removal needs --force/confirmation and is logged, every change is atomic with the last 5 backups, create_inst and server-token never overwrite an existing instance's forwards, removal archives forwards, no cross-instance writes, the last-forward guard counts real forwards, a TUI removal is forced only when it was confirmed as the last, re-running a token over a half-written instance works and a stuck one is reported, no benchmark path replaces or removes an existing local instance"

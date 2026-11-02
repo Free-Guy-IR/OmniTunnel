@@ -88,6 +88,16 @@ mk_inst m3w 16 'tcp:1\n'
 [[ "$(pfc m3w)" == "tcp:1 tcp:80 tcp:81 " ]] || bad "M3 'pf-add tcp \"80 81\"' stored [$(pfc m3w)], want tcp:80 and tcp:81 as before"
 ( set -euo pipefail; pf_del m3w "80 81" ) >/dev/null 2>&1
 [[ "$(pfc m3w)" == "tcp:1 " ]] || bad "M3 'pf-del \"80 81\"' left [$(pfc m3w)], want [tcp:1]"
+( set -euo pipefail; pf_add m3w tcp "$(printf '80\n81\n82')" ) >/dev/null 2>&1 || bad "M3 pf-add with a newline-separated list failed"
+[[ "$(pfc m3w)" == "tcp:1 tcp:80 tcp:81 tcp:82 " ]] || bad "M3 a newline-separated list stored [$(pfc m3w)], want tcp:80 tcp:81 tcp:82 after tcp:1"
+( set -euo pipefail; pf_del m3w "$(printf '80\n81')" ) >/dev/null 2>&1
+[[ "$(pfc m3w)" == "tcp:1 tcp:82 " ]] || bad "M3 a newline-separated pf-del left [$(pfc m3w)], want [tcp:1 tcp:82]"
+for spec in "443 : 8443" "443: 8443" "90,x,91" "92,0"; do
+    ( set -euo pipefail; pf_add m3w tcp "$spec" ) >/dev/null 2>&1; rc=$?
+    [[ $rc -ne 0 && "$(pfc m3w)" == "tcp:1 tcp:82 " ]] || bad "M3 pf-add '$spec' with an invalid part was not refused as a whole (rc=$rc, pf.conf [$(pfc m3w)])"
+    ( set -euo pipefail; pf_del m3w "$spec" ) >/dev/null 2>&1; rc=$?
+    [[ $rc -ne 0 && "$(pfc m3w)" == "tcp:1 tcp:82 " ]] || bad "M3 pf-del '$spec' with an invalid part was not refused as a whole (rc=$rc, pf.conf [$(pfc m3w)])"
+done
 
 mk_inst m4 4 'tcp:400\n\nudp:53\ntcp:8080\n'
 : > "$IPT"

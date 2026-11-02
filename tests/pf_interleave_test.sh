@@ -4,6 +4,7 @@ set -u
 
 SCRIPT="${1:-$(dirname "$0")/../omnitunnel.sh}"
 ROUNDS="${PF_ILV_ROUNDS:-3}"
+PF_LOCK_WAIT=300
 
 extract() {
     awk -v names="$1" '
