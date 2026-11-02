@@ -200,7 +200,7 @@ holder=$!
 n=0; while [[ ! -e "$WORK/held" && $n -lt 400 ]]; do sleep 0.01; n=$((n+1)); done
 out="$( PF_LOCK_WAIT=1; systemctl() { printf '%s\n' "$*" >> "$WORK/s7d.sys"; }; ( set -euo pipefail; cmd_server_token "$tok" ) 2>&1 )"; rc=$?
 rm -f "$WORK/hold"; wait "$holder" 2>/dev/null
-[[ $rc -ne 0 ]] && grep -q "could not remove the old instance 'stuck'" <<< "$out" || bad "S7 a token whose old instance could not be removed (pf lock busy) does not say so: rc=$rc [$(tail -n1 <<< "$out")]"
+if ! { [[ $rc -ne 0 ]] && grep -q "could not remove the old instance 'stuck'" <<< "$out"; }; then bad "S7 a token whose old instance could not be removed (pf lock busy) does not say so: rc=$rc [$(tail -n1 <<< "$out")]"; fi
 [[ -f "$INST_DIR/stuck/instance.conf" ]] || bad "S7 the old instance's config was removed although its removal could not take the pf lock"
 grep -q 'disable --now omnitun-stuck' "$WORK/s7d.sys" 2>/dev/null && bad "S7 the old instance was stopped and disabled before its removal could take the pf lock - the tunnel is left down"
 
@@ -217,7 +217,7 @@ out="$(
     ( set -euo pipefail; cmd_bench_server "$btok" ) 2>&1
     echo "rc=$?"
 )"
-[[ "$(tail -n1 <<< "$out")" == "rc=0" ]] && grep -q 'benchmark server ready' <<< "$out" || bad "S11 bench-server aborted when it could not replace an old bench-$bt instance: $(tail -n2 <<< "$out" | tr '\n' ' ')"
+if ! { [[ "$(tail -n1 <<< "$out")" == "rc=0" ]] && grep -q 'benchmark server ready' <<< "$out"; }; then bad "S11 bench-server aborted when it could not replace an old bench-$bt instance: $(tail -n2 <<< "$out" | tr '\n' ' ')"; fi
 [[ "$(pfc "bench-$bt")" == "$pbefore" ]] || bad "S11 bench-server overwrote the forwards of an instance it could not replace"
 
 mk_inst "bench-$bt" client 35 'tcp:7200\n'
