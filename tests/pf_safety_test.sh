@@ -16,9 +16,10 @@ extract() {
     }' "$SCRIPT"
 }
 
-eval "$(extract "tok_re inst_name_ok validate_inst_name list_instances inst_path inst_conf inst_pf inst_exists load_inst create_inst type_is_hysteria type_is_stripe type_is_ackless type_is_kernel type_is_revmux type_uses_key type_known dnat_chain norm_port pick_num rewrite_without lanes_ok tok_host_ok tok_ipv4_ok tok_port_ok tok_nc_ok tok_hexkey_ok tok_key_ok tok_shape_ok tok_pmode_ok cmd_server_token pf_line_parse pf_line_fmt pf_entries pf_spec_parse with_pf_lock ipt pf_fwd_apply pf_fwd_drop _pf_flush_chain _pf_apply_all _pf_add _pf_del pf_log pf_backup pf_write pf_archive_removed pf_apply_all pf_add pf_del cmd_pf_del pf_flush_chain pf_confirm_del pick_instance pick_proto pick_fwd_port mux_conf menu_pf _inst_remove_fwd inst_remove pause heading nitem rule_green cmd_bench_manual _bench_key_for")"
+eval "$(extract "tok_re inst_name_ok validate_inst_name list_instances inst_path inst_conf inst_pf inst_exists load_inst create_inst type_is_hysteria type_is_stripe type_is_ackless type_is_kernel type_is_revmux type_uses_key type_known dnat_chain norm_port pick_num rewrite_without lanes_ok tok_host_ok tok_ipv4_ok tok_port_ok tok_nc_ok tok_hexkey_ok tok_key_ok tok_shape_ok tok_pmode_ok cmd_server_token pf_line_parse pf_line_fmt pf_entries pf_spec_parse with_pf_lock ipt pf_fwd_apply pf_fwd_drop _pf_flush_chain _pf_apply_all _pf_add _pf_del pf_log pf_backup pf_write pf_archive_removed pf_apply_all pf_add pf_del cmd_pf_del pf_flush_chain pf_confirm_del pick_instance pick_proto pick_fwd_port mux_conf menu_pf _inst_remove_fwd inst_remove pause heading nitem rule_green _drule svc_name cmd_bench_manual _bench_key_for cmd_bench_server bench_run")"
 eval "$(grep -E '^(C_|G_)[A-Z_]+=' "$SCRIPT")"
 eval "$(grep -m1 '^ALL_TYPES=' "$SCRIPT")"
+eval "$(grep -m1 '^UI_W=' "$SCRIPT")"
 
 FAILS=0
 bad() { echo "FAIL: $*"; FAILS=$((FAILS+1)); }
@@ -78,6 +79,11 @@ grep -q 'EMPTIED' "$ROOT_DIR/pf.log" 2>/dev/null || bad "S2 the forced emptying 
 mk_inst two client 2 'tcp:443\n'
 ( set -euo pipefail; cmd_pf_del two 443 --force ) >/dev/null 2>&1; rc=$?
 [[ $rc -eq 0 && "$(fwd_lines two)" == 0 ]] || bad "S2 'pf-del <inst> <port> --force' did not remove the last forward (rc=$rc)"
+
+mk_inst junk client 13 'tcp:400\n#note\n \n'
+jbefore="$(pfc junk)"
+( set -euo pipefail; pf_del junk 400 ) >/dev/null 2>&1; rc=$?
+[[ $rc -ne 0 && "$(pfc junk)" == "$jbefore" ]] || bad "S1 pf-del of the last real forward next to a comment/blank line went through without --force (rc=$rc, pf.conf now [$(pfc junk | tr '\n' ' ')])"
 
 mk_inst three client 3 ''
 for p in 1001 1002 1003 1004 1005 1006 1007 1008; do
@@ -148,6 +154,17 @@ sub="$(
 [[ -z "$sub" ]] || printf '%s\n' "$sub"
 FAILS=$((FAILS + $(grep -c '^FAIL:' <<< "$sub")))
 
+sub="$(
+    INST_DIR="$WORK/tui2"; mkdir -p "$INST_DIR"
+    mk_inst race client 21 'tcp:443\ntcp:80\n'
+    eval "_real_$(declare -f pf_del)"
+    pf_del() { printf 'tcp:443\n' > "$INST_DIR/$1/pf.conf"; _real_pf_del "$@"; }
+    ( set -euo pipefail; menu_pf <<< $'2\n1\n1\ny\n\n0\n' ) >/dev/null 2>&1
+    [[ "$(pfc race)" == "tcp:443" ]] || bad "S10 a TUI removal confirmed while it was NOT the last forward emptied the instance after a concurrent pf-del made it the last (pf.conf now [$(pfc race | tr '\n' ' ')])"
+)"
+[[ -z "$sub" ]] || printf '%s\n' "$sub"
+FAILS=$((FAILS + $(grep -c '^FAIL:' <<< "$sub")))
+
 bt=""; for t in $ALL_TYPES; do type_is_hysteria "$t" || type_is_revmux "$t" || { bt="$t"; break; }; done
 mk_inst "bench-$bt" client 31 'tcp:7000\nudp:7000\n'
 pbefore="$(pfc "bench-$bt")"; cbefore="$(cat "$INST_DIR/bench-$bt/instance.conf")"
@@ -167,5 +184,48 @@ out="$(
 [[ -d "$INST_DIR/bench-$bt" && "$(pfc "bench-$bt")" == "$pbefore" && "$(cat "$INST_DIR/bench-$bt/instance.conf" 2>/dev/null)" == "$cbefore" ]] || bad "S11 the manual benchmark overwrote or removed the existing local instance bench-$bt and its forwards"
 grep -q "bench-$bt' already exists" <<< "$out" || bad "S11 the manual benchmark did not say why it skipped bench-$bt"
 
+mkdir -p "$INST_DIR/half"; printf 'TYPE=gre\n' > "$INST_DIR/half/instance.conf"; : > "$INST_DIR/half/pf.conf"
+tok="$(printf 'half|gre|203.0.113.9|1.2.3.4|51830||10.201.32.2|10.201.32.1|none|16||1' | base64 | tr -d '\n')"
+( set -euo pipefail; cmd_server_token "$tok" ) >/dev/null 2>&1; rc=$?
+[[ $rc -eq 0 ]] || bad "S7 re-running a token over a half-written instance (no ROLE, no forwards) is refused (rc=$rc) - the token is no longer retryable"
+mk_inst stuck server 33 ''
+tok="$(printf 'stuck|gre|203.0.113.9|1.2.3.4|51831||10.201.33.2|10.201.33.1|none|16||1' | base64 | tr -d '\n')"
+out="$( inst_remove() { :; }; ( set -euo pipefail; cmd_server_token "$tok" ) 2>&1 )"; rc=$?
+[[ $rc -ne 0 ]] && grep -q "could not remove the old instance 'stuck'" <<< "$out" || bad "S7 a token whose old instance could not be removed (pf lock busy) does not say so: rc=$rc [$(tail -n1 <<< "$out")]"
+
+mk_inst "bench-$bt" server 34 'tcp:7100\n'
+pbefore="$(pfc "bench-$bt")"
+ktok="$(printf 'a%.0s' {1..64})"
+btok="$(printf 'bench|203.0.113.50|192.0.2.1|%s|%s|%s' "$ktok" "$ktok" "$ktok" | base64 | tr -d '\n')"
+out="$(
+    ALL_TYPES="$bt"
+    ensure_binary() { :; }
+    iperf3() { :; }
+    systemd-run() { :; }
+    inst_remove() { :; }
+    ( set -euo pipefail; cmd_bench_server "$btok" ) 2>&1
+    echo "rc=$?"
+)"
+[[ "$(tail -n1 <<< "$out")" == "rc=0" ]] && grep -q 'benchmark server ready' <<< "$out" || bad "S11 bench-server aborted when it could not replace an old bench-$bt instance: $(tail -n2 <<< "$out" | tr '\n' ' ')"
+[[ "$(pfc "bench-$bt")" == "$pbefore" ]] || bad "S11 bench-server overwrote the forwards of an instance it could not replace"
+
+mk_inst "bench-$bt" client 35 'tcp:7200\n'
+pbefore="$(pfc "bench-$bt")"
+out="$(
+    ALL_TYPES="$bt"; ASSET_DIR="$WORK/asset"; SCRIPT_DIR="$WORK/asset"; SCRIPT_PATH="$WORK/asset/omnitunnel.sh"
+    mkdir -p "$ASSET_DIR/bin"; : > "$ASSET_DIR/bin/omnitun-amd64"
+    ensure_binary() { :; }; save_peer() { :; }; default_local_ip() { echo 192.0.2.1; }; guard_peer_downgrade() { :; }
+    iperf3() { return 1; }
+    peer_ssh() { [[ "${2:-}" == "uname -m" ]] && echo x86_64; return 0; }
+    peer_scp() { :; }; hy_local_bin() { return 1; }; omnistripe_local_bin() { return 1; }; omniackless_local_bin() { return 1; }
+    bench_ensure_iperf() { :; }; bench_ensure_httpfile() { :; }; sleep() { :; }; ping() { return 1; }; nc() { return 1; }
+    bench_create_id() { BENCH_ID=t1; }; bench_clean_abandoned() { :; }; next_subnet_idx() { echo 60; }
+    bench_peer_remove() { :; }; bench_run_done() { :; }; bench_table() { :; }; type_desc() { :; }
+    ( set -euo pipefail; bench_run <<< $'203.0.113.50\nroot\n\n\n\n\n' ) 2>&1
+    echo "rc=$?"
+)"
+[[ -d "$INST_DIR/bench-$bt" && "$(pfc "bench-$bt")" == "$pbefore" ]] || bad "S11 the SSH benchmark said it skipped the existing local bench-$bt and then removed it in its cleanup: $(tail -n2 <<< "$out" | tr '\n' ' ')"
+grep -q "bench-$bt' already exists" <<< "$out" || bad "S11 the SSH benchmark did not report the existing local bench-$bt"
+
 if [[ "$FAILS" -ne 0 ]]; then echo "pf_safety_test: $FAILS failure(s)"; exit 1; fi
-echo "PASSED - pf_safety_test: last-forward removal needs --force/confirmation and is logged, every change is atomic with the last 5 backups, create_inst and server-token never overwrite an existing instance's forwards, removal archives forwards, no cross-instance writes, the manual benchmark never replaces an existing local instance"
+echo "PASSED - pf_safety_test: last-forward removal needs --force/confirmation and is logged, every change is atomic with the last 5 backups, create_inst and server-token never overwrite an existing instance's forwards, removal archives forwards, no cross-instance writes, the last-forward guard counts real forwards, a TUI removal is forced only when it was confirmed as the last, re-running a token over a half-written instance works and a stuck one is reported, no benchmark path replaces or removes an existing local instance"

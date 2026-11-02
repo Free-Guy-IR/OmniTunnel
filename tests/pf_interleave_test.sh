@@ -102,6 +102,7 @@ for r in $(seq 1 "$ROUNDS"); do
     ROOT_DIR="$WORK/r$r/etc"; INST_DIR="$ROOT_DIR/inst"; NAT="$WORK/r$r/nat"; FLT="$WORK/r$r/filter"; RUN_DIR="$WORK/r$r/run"
     mkdir -p "$INST_DIR" "$NAT" "$FLT"; : > "$FLT/FORWARD"
     mk_inst alpha 1 ''
+    head -c 1048577 /dev/zero | tr '\0' x > "$ROOT_DIR/pf.log"
     mk_inst beta 2 'tcp:3999\n'
     for i in $(seq 0 11); do
         spec="$((2000 + i))"; (( i % 2 )) || spec="$spec:$((2100 + i))"
@@ -127,9 +128,11 @@ for r in $(seq 1 "$ROUNDS"); do
     [[ "$bogus" == 0 ]] || bad "round $r: corrupted lines in a pf.conf"
     [[ -z "$(find "$INST_DIR" -name '.pf.conf.*' -o -name 'pf.conf.??????')" ]] || bad "round $r: temp files left behind"
 
+    [[ "$(stat -c %s "$ROOT_DIR/pf.log.1" 2>/dev/null || echo 0)" -gt 1048576 ]] || bad "round $r: concurrent changes on two instances rotated pf.log twice and lost its 1 MiB history"
+    [[ "$(grep -c ' pf-' "$ROOT_DIR/pf.log" 2>/dev/null || true)" -ge 24 ]] || bad "round $r: pf.log lost change records under concurrency ($(grep -c ' pf-' "$ROOT_DIR/pf.log" 2>/dev/null || true) lines)"
     chain_vs_file alpha 10.201.1.2
     chain_vs_file beta 10.201.2.2
 done
 
 if [[ "$FAILS" -ne 0 ]]; then echo "pf_interleave_test: $FAILS failure(s)"; exit 1; fi
-echo "PASSED - pf_interleave_test: $ROUNDS rounds of concurrent pf-add/pf-del on two instances plus concurrent _postup applies (install restarts), plain and public:target, lose no forward, duplicate none, leave no temp file, and both the nat chains and the FORWARD accept chains end equal to pf.conf with one jump each"
+echo "PASSED - pf_interleave_test: $ROUNDS rounds of concurrent pf-add/pf-del on two instances plus concurrent _postup applies (install restarts), plain and public:target, lose no forward, duplicate none, leave no temp file, and both the nat chains and the FORWARD accept chains end equal to pf.conf with one jump each, and the shared pf.log rotates once without losing history"

@@ -83,6 +83,12 @@ mk_inst m3 3 ''
 ( set -euo pipefail; pf_add m3 tcp 9000:9001,80,7000:7000 ) >/dev/null 2>&1 || bad "M3 pf-add with a mixed list failed"
 [[ "$(pfc m3)" == "tcp:9000:9001 tcp:80 tcp:7000 " ]] || bad "M3 mixed list stored as [$(pfc m3)], want [tcp:9000:9001 tcp:80 tcp:7000]"
 
+mk_inst m3w 16 'tcp:1\n'
+( set -euo pipefail; pf_add m3w tcp "80 81" ) >/dev/null 2>&1 || bad "M3 pf-add with a space-separated list failed"
+[[ "$(pfc m3w)" == "tcp:1 tcp:80 tcp:81 " ]] || bad "M3 'pf-add tcp \"80 81\"' stored [$(pfc m3w)], want tcp:80 and tcp:81 as before"
+( set -euo pipefail; pf_del m3w "80 81" ) >/dev/null 2>&1
+[[ "$(pfc m3w)" == "tcp:1 " ]] || bad "M3 'pf-del \"80 81\"' left [$(pfc m3w)], want [tcp:1]"
+
 mk_inst m4 4 'tcp:400\n\nudp:53\ntcp:8080\n'
 : > "$IPT"
 ( set -euo pipefail; pf_apply_all m4 ) >/dev/null 2>&1 || bad "M4 an old-format pf.conf no longer applies"
