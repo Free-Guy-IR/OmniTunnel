@@ -337,7 +337,8 @@ omnitunnel pf-check <instance>                 # rule hits, peer port, conflicts
 ```
 
 or use the **Port forwarding** menu (it lists mapped forwards as
-`4702 -> peer port 702` and asks before it removes anything).
+`4702 -> peer port 702` and asks before it removes a port forward; removing
+a muxed forward there does not ask).
 
 - `pf.conf` keeps the old `proto:port` lines for plain forwards and adds
   `proto:public:target` lines for mapped ones. Managers older than v2.9.15 do

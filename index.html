@@ -758,8 +758,9 @@
     <div class="cli">omnitunnel
 omnitunnel bench
 omnitunnel list
-omnitunnel pf-add  main both 8080
+omnitunnel pf-add  main both 8080,8443:443
 omnitunnel pf-del  main 8080
+omnitunnel pf-check main
 omnitunnel mux-add main 443 127.0.0.1 443
 
 omnitunnel add-auto   gre    second  &lt;foreign_ip&gt;
