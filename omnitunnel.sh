@@ -990,7 +990,7 @@ with_pf_lock() {
         chmod 700 "$RUN_DIR" 2>/dev/null || true
         if exec {fd}>>"$RUN_DIR/pf.$key.lock"; then
             chmod 600 "$RUN_DIR/pf.$key.lock" 2>/dev/null || true
-            if flock -w 30 "$fd"; then "$@" || rc=$?; else rc=1; fi
+            if flock -w 30 "$fd"; then "$@" || rc=$?; else warn "timed out waiting for the port-forward lock of '$name' (another omnitunnel run holds it) - nothing changed"; rc=1; fi
             exec {fd}>&-
             return "$rc"
         fi
@@ -1119,14 +1119,14 @@ _pf_apply_all() {
 }
 ipt() { iptables -w 10 "$@"; }
 pf_fwd_apply() {
-    local name="$1" ch="$2" pf="$3" n="$4" ok=1 old i proto port at drop
+    local name="$1" ch="$2" pf="$3" n="$4" ok=1 old i proto pub tgt at drop
     if [[ "$n" -eq 0 ]]; then pf_fwd_drop "$ch"; return 0; fi
     ipt -N "$ch" 2>/dev/null || true
     old="$(ipt -S "$ch" 2>/dev/null | grep -c "^-A $ch " || true)"
-    while IFS=: read -r proto port; do [[ -z "$proto" ]] && continue
-        ipt -A "$ch" ! -i "$DEV" -o "$DEV" -d "$PEER_ADDR" -p "$proto" --dport "$port" -m conntrack --ctstate DNAT --ctdir ORIGINAL --ctorigdstport "$port" -j ACCEPT 2>/dev/null || ok=0
-        ipt -A "$ch" -i "$DEV" -s "$PEER_ADDR" -p "$proto" --sport "$port" -m conntrack --ctstate DNAT --ctdir REPLY --ctorigdstport "$port" -j ACCEPT 2>/dev/null || ok=0
-    done < "$pf"
+    while read -r proto pub tgt; do
+        ipt -A "$ch" ! -i "$DEV" -o "$DEV" -d "$PEER_ADDR" -p "$proto" --dport "$tgt" -m conntrack --ctstate DNAT --ctdir ORIGINAL --ctorigdstport "$pub" -j ACCEPT 2>/dev/null || ok=0
+        ipt -A "$ch" -i "$DEV" -s "$PEER_ADDR" -p "$proto" --sport "$tgt" -m conntrack --ctstate DNAT --ctdir REPLY --ctorigdstport "$pub" -j ACCEPT 2>/dev/null || ok=0
+    done < <(pf_entries "$pf")
     ipt -A "$ch" -o "$DEV" -p icmp -m conntrack --ctstate RELATED --ctreplsrc "$PEER_ADDR" -m conntrack --ctstate DNAT -j ACCEPT 2>/dev/null || ok=0
     ipt -A "$ch" -i "$DEV" -p icmp -m conntrack --ctstate RELATED --ctreplsrc "$PEER_ADDR" -m conntrack --ctstate DNAT -j ACCEPT 2>/dev/null || ok=0
     for ((i = 0; i < 10#$old; i++)); do ipt -D "$ch" 1 2>/dev/null || break; done
@@ -2957,6 +2957,9 @@ cmd_bench_manual() {
         { type_is_hysteria "$t" || type_is_revmux "$t"; } && { i=$((i+1)); continue; }  # manual bench (fixed keys) skips hysteria; use auto bench for it
         local name="bench-$t" sub=$((100+i)) port=$((51900+i)) key; key=$(_bench_key_for "$t")
         local ta="10.201.$sub.1" pa="10.201.$sub.2"
+        if inst_exists "$name"; then
+            rows+=("$t|FAIL|FAIL|100%|n/a"); echo "  $t ... FAIL (a local instance named '$name' already exists - remove it, or run: omnitunnel bench-clean)"; i=$((i+1)); continue
+        fi
         echo -n "  $t ... "
         create_inst "$name" "$t" client "$mylip" "$fhost" "$port" "$key" "$ta" "$pa" none 8
         inst_enable "$name" >/dev/null 2>&1; sleep 6
