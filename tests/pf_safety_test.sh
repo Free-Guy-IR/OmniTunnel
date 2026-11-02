@@ -16,7 +16,7 @@ extract() {
     }' "$SCRIPT"
 }
 
-eval "$(extract "tok_re inst_name_ok validate_inst_name list_instances inst_path inst_conf inst_pf inst_exists load_inst create_inst type_is_hysteria type_is_stripe type_is_ackless type_is_kernel type_is_revmux type_uses_key type_known dnat_chain norm_port pick_num rewrite_without lanes_ok tok_host_ok tok_ipv4_ok tok_port_ok tok_nc_ok tok_hexkey_ok tok_key_ok tok_shape_ok tok_pmode_ok cmd_server_token pf_line_parse pf_line_fmt pf_entries pf_spec_parse with_pf_lock ipt pf_fwd_apply pf_fwd_drop _pf_flush_chain _pf_apply_all _pf_add _pf_del pf_log pf_backup pf_write pf_archive_removed pf_apply_all pf_add pf_del cmd_pf_del pf_flush_chain pf_confirm_del pick_instance pick_proto pick_fwd_port mux_conf menu_pf _inst_remove_fwd inst_remove pause heading nitem rule_green")"
+eval "$(extract "tok_re inst_name_ok validate_inst_name list_instances inst_path inst_conf inst_pf inst_exists load_inst create_inst type_is_hysteria type_is_stripe type_is_ackless type_is_kernel type_is_revmux type_uses_key type_known dnat_chain norm_port pick_num rewrite_without lanes_ok tok_host_ok tok_ipv4_ok tok_port_ok tok_nc_ok tok_hexkey_ok tok_key_ok tok_shape_ok tok_pmode_ok cmd_server_token pf_line_parse pf_line_fmt pf_entries pf_spec_parse with_pf_lock ipt pf_fwd_apply pf_fwd_drop _pf_flush_chain _pf_apply_all _pf_add _pf_del pf_log pf_backup pf_write pf_archive_removed pf_apply_all pf_add pf_del cmd_pf_del pf_flush_chain pf_confirm_del pick_instance pick_proto pick_fwd_port mux_conf menu_pf _inst_remove_fwd inst_remove pause heading nitem rule_green cmd_bench_manual _bench_key_for")"
 eval "$(grep -E '^(C_|G_)[A-Z_]+=' "$SCRIPT")"
 eval "$(grep -m1 '^ALL_TYPES=' "$SCRIPT")"
 
@@ -148,5 +148,24 @@ sub="$(
 [[ -z "$sub" ]] || printf '%s\n' "$sub"
 FAILS=$((FAILS + $(grep -c '^FAIL:' <<< "$sub")))
 
+bt=""; for t in $ALL_TYPES; do type_is_hysteria "$t" || type_is_revmux "$t" || { bt="$t"; break; }; done
+mk_inst "bench-$bt" client 31 'tcp:7000\nudp:7000\n'
+pbefore="$(pfc "bench-$bt")"; cbefore="$(cat "$INST_DIR/bench-$bt/instance.conf")"
+out="$(
+    ALL_TYPES="$bt"; RAW_BASE="https://example.invalid"
+    gen_key() { echo 00; }
+    ping() { return 1; }
+    nc() { return 1; }
+    iperf3() { return 1; }
+    sleep() { :; }
+    bench_table() { :; }
+    type_desc() { :; }
+    ( set -euo pipefail; cmd_bench_manual 203.0.113.50 192.0.2.1 <<< $'\n\n' ) 2>&1
+    echo "rc=$?"
+)"
+[[ "$(tail -n1 <<< "$out")" == "rc=0" ]] || bad "S11 the manual benchmark aborted ($(tail -n1 <<< "$out")) because a local instance named bench-$bt already exists"
+[[ -d "$INST_DIR/bench-$bt" && "$(pfc "bench-$bt")" == "$pbefore" && "$(cat "$INST_DIR/bench-$bt/instance.conf" 2>/dev/null)" == "$cbefore" ]] || bad "S11 the manual benchmark overwrote or removed the existing local instance bench-$bt and its forwards"
+grep -q "bench-$bt' already exists" <<< "$out" || bad "S11 the manual benchmark did not say why it skipped bench-$bt"
+
 if [[ "$FAILS" -ne 0 ]]; then echo "pf_safety_test: $FAILS failure(s)"; exit 1; fi
-echo "PASSED - pf_safety_test: last-forward removal needs --force/confirmation and is logged, every change is atomic with the last 5 backups, create_inst and server-token never overwrite an existing instance's forwards, removal archives forwards, no cross-instance writes"
+echo "PASSED - pf_safety_test: last-forward removal needs --force/confirmation and is logged, every change is atomic with the last 5 backups, create_inst and server-token never overwrite an existing instance's forwards, removal archives forwards, no cross-instance writes, the manual benchmark never replaces an existing local instance"

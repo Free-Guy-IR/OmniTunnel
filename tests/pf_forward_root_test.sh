@@ -43,6 +43,7 @@ die() { echo "DIE: $*" >&2; exit 1; }
 need_root() { :; }
 apply_tuning() { :; }
 hy_pf_reconcile() { :; }
+pf_warn_conflicts() { :; }
 
 WORK="$(mktemp -d)"
 PIDS=()
@@ -227,4 +228,12 @@ for _ in $(seq 1 15); do
 done
 pf_fwd_drop TSUITE_FWE 2>/dev/null || true; rm -rf "$INST_DIR/fwe"
 
-echo "PASSED - pf_forward_root_test: UDP and TCP forwards cross a FORWARD DROP policy, untranslated traffic, foreign DNATs and tunnel-initiated connections stay dropped, rules rebuilt on unit start and survive a late Docker-like firewall, 20-round apply/apply and apply/flush interleaving keeps the other instance intact, concurrent pf-add/pf-del never lose a port, instance removal under the pf lock never orphans a chain against a racing pf-add, exact teardown"
+mk_inst fwm ts-fwa 10.88.2.2 udp:5543:5443 tcp:5544:5444
+pf_apply_all fwm
+[[ "$(probe udp 10.88.1.1 5543)" == OK ]] || fail "a public:target UDP forward (5543 -> peer 5443) carried nothing through a FORWARD DROP policy: $(iptables -w -S | tr '\n' '|')"
+[[ "$(probe tcp 10.88.1.1 5544)" == OK ]] || fail "a public:target TCP forward (5544 -> peer 5444) carried nothing through a FORWARD DROP policy: $(iptables -w -S | tr '\n' '|')"
+[[ "$(probe udp 10.88.1.1 5443)" != OK ]] || fail "the peer port of a public:target forward is reachable from the public side as well"
+pf_flush_chain fwm
+if ! { [[ "$(jumps TSUITE_FWM)" == 0 ]] && ! chain_exists TSUITE_FWM; }; then fail "flush left state for fwm"; fi
+
+echo "PASSED - pf_forward_root_test: UDP and TCP forwards cross a FORWARD DROP policy, untranslated traffic, foreign DNATs and tunnel-initiated connections stay dropped, rules rebuilt on unit start and survive a late Docker-like firewall, 20-round apply/apply and apply/flush interleaving keeps the other instance intact, concurrent pf-add/pf-del never lose a port, instance removal under the pf lock never orphans a chain against a racing pf-add, public:target forwards carry traffic under the DROP policy, exact teardown"

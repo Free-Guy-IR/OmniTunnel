@@ -149,6 +149,8 @@ chain_has() { iptables -w -S "$1" 2>/dev/null | grep -qxF -- "-A $1 $2"; }
 chain_exists() { iptables -w -S "$1" >/dev/null 2>&1; }
 orig_rule() { printf -- '! -i %s -o %s -d %s -p %s --dport %s -m conntrack --ctstate DNAT --ctdir ORIGINAL --ctorigdstport %s -j ACCEPT' "$1" "$1" "$2" "$3" "$4" "$4"; }
 repl_rule() { printf -- '-i %s -s %s -p %s --sport %s -m conntrack --ctstate DNAT --ctdir REPLY --ctorigdstport %s -j ACCEPT' "$1" "$2" "$3" "$4" "$4"; }
+orig_map() { printf -- '! -i %s -o %s -d %s -p %s --dport %s -m conntrack --ctstate DNAT --ctdir ORIGINAL --ctorigdstport %s -j ACCEPT' "$1" "$1" "$2" "$3" "$4" "$5"; }
+repl_map() { printf -- '-i %s -s %s -p %s --sport %s -m conntrack --ctstate DNAT --ctdir REPLY --ctorigdstport %s -j ACCEPT' "$1" "$2" "$3" "$4" "$5"; }
 icmp_rule() { printf -- '%s %s -p icmp -m conntrack --ctstate RELATED --ctreplsrc %s -m conntrack --ctstate DNAT -j ACCEPT' "$1" "$2" "$3"; }
 dump() { iptables -w -S | tr '\n' '|'; }
 no_state() { [[ "$(jumps "$1")" == 0 ]] && ! chain_exists "$1"; }
@@ -253,4 +255,18 @@ no_state TSUITE_A || fail "a final flush did not clear a after the interleaving:
 [[ "$(jumps DOCKER-USER)" == 1 && "$(fwd | grep -cxF -- '-A FORWARD -o eth9 -j ACCEPT')" == 1 ]] || fail "interleaving touched Docker or unrelated rules"
 iptables -w -t nat -S | grep -q -- '-A TSUITE_B ' || fail "interleaving lost b's nat rules"
 
-echo "PASSED - pf_forward_accept_test: per-instance FORWARD chain appended after admin rules, exact per-forward original/reply accepts bound to the original port, related icmp, no broad device accept, gap-free idempotent rebuild, follows pf-del down to no state, every call lock-bounded, warns on an unconditional DROP above it, nothing for hysteria or an empty forward set, exact teardown, 20-round interleaving"
+mk_inst map gre ts-map 10.201.45.2 tcp:9443:443 udp:5353:53 tcp:0 bogus tcp:8080
+seed
+pf_apply_all map
+[[ "$(chain_rules TSUITE_MAP)" == 8 ]] || fail "want 2 accepts per valid forward (3) + 2 related icmp = 8, got $(chain_rules TSUITE_MAP): $(dump)"
+chain_has TSUITE_MAP "$(orig_map ts-map 10.201.45.2 tcp 443 9443)" || fail "public:target tcp 9443 -> peer 443 has no original-direction accept to the peer port bound to the public port: $(dump)"
+chain_has TSUITE_MAP "$(repl_map ts-map 10.201.45.2 tcp 443 9443)" || fail "public:target tcp 9443 -> peer 443 has no reply-direction accept: $(dump)"
+chain_has TSUITE_MAP "$(orig_map ts-map 10.201.45.2 udp 53 5353)" || fail "public:target udp 5353 -> peer 53 has no original-direction accept: $(dump)"
+chain_has TSUITE_MAP "$(repl_map ts-map 10.201.45.2 udp 53 5353)" || fail "public:target udp 5353 -> peer 53 has no reply-direction accept: $(dump)"
+chain_has TSUITE_MAP "$(orig_rule ts-map 10.201.45.2 tcp 8080)" || fail "a plain forward next to mapped ones lost its accept: $(dump)"
+iptables -w -t nat -S TSUITE_MAP | grep -qxF -- '-A TSUITE_MAP -p tcp --dport 9443 -j DNAT --to-destination 10.201.45.2:443' || fail "public:target tcp 9443 is not DNATed to peer port 443: $(iptables -w -t nat -S | tr '\n' '|')"
+[[ ! -s "$WARN_LOG" ]] || fail "a public:target or malformed pf.conf line made the FORWARD rebuild warn: $(cat "$WARN_LOG")"
+pf_flush_chain map
+no_state TSUITE_MAP || fail "flush of a mapped instance left FORWARD state: $(dump)"
+
+echo "PASSED - pf_forward_accept_test: per-instance FORWARD chain appended after admin rules, exact per-forward original/reply accepts bound to the original port, related icmp, no broad device accept, gap-free idempotent rebuild, follows pf-del down to no state, every call lock-bounded, warns on an unconditional DROP above it, nothing for hysteria or an empty forward set, exact teardown, 20-round interleaving, public:target forwards accepted on the peer port bound to the public port, malformed pf.conf lines never become rules"
