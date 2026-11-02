@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# shellcheck disable=SC2034,SC2317
+# shellcheck disable=SC2034,SC2317,SC2030,SC2031
 set -u
 
 SCRIPT="${1:-$(dirname "$0")/../omnitunnel.sh}"
