@@ -736,7 +736,7 @@
       <div class="cell">
         <span class="tag">safety</span>
         <h3>Conflict detection</h3>
-        <p>Warns before adding a forward if another rule or a local listener already claims that port — the exact failure mode that once broke this silently.</p>
+        <p>Warns when adding a forward if another DNAT rule already claims that port ahead of it, and <code>pf-check</code> reports shadowing, duplicate and stale rules — the exact failure mode that once broke this silently.</p>
       </div>
       <div class="cell">
         <span class="tag">multi-instance</span>
