@@ -18,8 +18,9 @@ BINLINK="/usr/local/bin/omnitunnel"
 
 INSTALL_LOCK_FD=""
 if command -v flock >/dev/null 2>&1; then
-    { exec {INSTALL_LOCK_FD}>/run/omnitunnel-install.lock; } 2>/dev/null \
-        || { exec {INSTALL_LOCK_FD}>/tmp/omnitunnel-install.lock; } 2>/dev/null \
+    mkdir -p "$DEST" 2>/dev/null || true
+    { exec {INSTALL_LOCK_FD}<>/run/omnitunnel-install.lock; } 2>/dev/null \
+        || { exec {INSTALL_LOCK_FD}<>"$DEST/.install.lock"; } 2>/dev/null \
         || INSTALL_LOCK_FD=""
 fi
 if [[ -n "$INSTALL_LOCK_FD" ]] && ! flock -n "$INSTALL_LOCK_FD"; then
