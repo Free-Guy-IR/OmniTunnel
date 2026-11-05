@@ -20,7 +20,7 @@
 # /etc/icmptun install (this tool never reads, edits or deletes that).
 set -euo pipefail
 
-VERSION="2.9.15"
+VERSION="2.9.16"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 
@@ -119,12 +119,129 @@ rewrite_without() {
     return 0
 }
 
+OMNI_PKG_LOG="${OMNI_PKG_LOG:-/var/log/omnitunnel-install.log}"
+OMNI_APT_OPTS=(-o DPkg::Lock::Timeout=120 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 -o Acquire::Retries=1 -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
+OMNI_APT_PREPARED=0
+OMNI_APT_UPDATED=0
+CURL_DL=(-fL --connect-timeout 15 --retry 3 --retry-delay 3 --speed-limit 1024 --speed-time 60 -sS)
+pkg_log() { printf '%s %s\n' "$(date '+%F %T')" "$*" >>"$OMNI_PKG_LOG" 2>/dev/null || true; }
+pkg_run() {
+    local limit="$1"; shift
+    pkg_log "+ $*"
+    env DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPEND=1 NEEDRESTART_MODE=l APT_LISTCHANGES_FRONTEND=none \
+        timeout -k 10 "$limit" "$@" </dev/null >>"$OMNI_PKG_LOG" 2>&1
+}
+pkg_fail_hint() {
+    tail -n 12 "$OMNI_PKG_LOG" 2>/dev/null | sed 's/^/    /' || true
+    echo "    full log: $OMNI_PKG_LOG"
+}
+dpkg_ok() { dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q 'install ok installed'; }
+stuck_debconf_pids() {
+    local d a
+    if ps -eo pid=,etimes=,args= >/dev/null 2>&1; then
+        ps -eo pid=,etimes=,args= 2>/dev/null | awk -v min="${1:-0}" '$2 >= min && $0 ~ /\/var\/lib\/dpkg\/info\/(iperf3|tzdata)\.(config|postinst) configure/ { print $1 }' || true
+        return 0
+    fi
+    for d in /proc/[0-9]*; do
+        a="$(tr '\0' ' ' <"$d/cmdline" 2>/dev/null)" || continue
+        [[ "$a" =~ /var/lib/dpkg/info/(iperf3|tzdata)\.(config|postinst)\ configure ]] && echo "${d#/proc/}"
+    done
+    return 0
+}
+dpkg_busy() {
+    local f c
+    for f in /proc/[0-9]*/comm; do
+        { read -r c <"$f"; } 2>/dev/null || continue
+        [[ "$c" == dpkg ]] && return 0
+    done
+    return 1
+}
+dpkg_broken() {
+    command -v dpkg-query >/dev/null 2>&1 || return 1
+    dpkg_busy && return 1
+    dpkg-query -W -f='${db:Status-Abbrev}\n' 2>/dev/null | grep -qE '^.[UFHWT]|^..R' && return 0
+    [[ -n "$(ls -A /var/lib/dpkg/updates 2>/dev/null)" ]]
+}
+clear_stuck_install() {
+    local pids i
+    pids="$(stuck_debconf_pids 15)"
+    [[ -n "$pids" ]] || return 0
+    warn "an earlier package install is stuck on a hidden question (iperf3 'start as a daemon?' or tzdata 'time zone') - stopping it (pid $(echo $pids))"
+    pkg_log "stopping stuck debconf pids: $(echo $pids)"
+    kill $pids 2>/dev/null || true
+    for i in 1 2 3 4 5; do [[ -z "$(stuck_debconf_pids 0)" ]] && break; sleep 1; done
+    pids="$(stuck_debconf_pids 0)"
+    [[ -z "$pids" ]] || kill -9 $pids 2>/dev/null || true
+    for i in $(seq 1 20); do dpkg_busy || break; sleep 1; done
+}
+apt_prepare() {
+    local i
+    [[ "$OMNI_APT_PREPARED" == 1 ]] && return 0
+    OMNI_APT_PREPARED=1
+    clear_stuck_install
+    if ! dpkg_ok iperf3 && command -v debconf-set-selections >/dev/null 2>&1; then
+        printf 'iperf3 iperf3/start_daemon boolean false\n' | debconf-set-selections >/dev/null 2>&1 || true
+    fi
+    dpkg_broken || return 0
+    info "repairing an interrupted package install (dpkg --configure -a)..."
+    for i in $(seq 1 24); do
+        pkg_run 300 dpkg --force-confdef --force-confold --configure -a && return 0
+        tail -n 5 "$OMNI_PKG_LOG" 2>/dev/null | grep -qi 'lock' || break
+        sleep 5
+    done
+    warn "could not finish the interrupted package install (see $OMNI_PKG_LOG)"
+    return 0
+}
+pkg_install() {
+    local p rc=0
+    [[ $# -gt 0 ]] || return 0
+    if command -v apt-get >/dev/null 2>&1; then
+        apt_prepare
+        if [[ "$OMNI_APT_UPDATED" != 1 ]]; then
+            OMNI_APT_UPDATED=1
+            info "updating package lists (apt-get update, up to 4 min)..."
+            pkg_run 240 apt-get "${OMNI_APT_OPTS[@]}" update || warn "apt-get update did not finish cleanly (a mirror may be unreachable) - trying the install anyway"
+        fi
+        info "installing $* (waits up to 2 min if another apt is running)..."
+        pkg_run 900 apt-get "${OMNI_APT_OPTS[@]}" install -y --no-install-recommends "$@" && return 0
+        for p in "$@"; do
+            dpkg_ok "$p" || pkg_run 600 apt-get "${OMNI_APT_OPTS[@]}" install -y --no-install-recommends "$p" || rc=1
+        done
+        return "$rc"
+    elif command -v yum >/dev/null 2>&1; then
+        info "installing $* with yum (up to 15 min)..."
+        pkg_run 900 yum install -y "$@" && return 0
+    fi
+    return 1
+}
+ensure_cmd_pkg() {
+    if command -v apt-get >/dev/null 2>&1 && { [[ -n "$(stuck_debconf_pids 15)" ]] || dpkg_broken; }; then apt_prepare; fi
+    command -v "$1" >/dev/null 2>&1 && return 0
+    pkg_install "$2" || true
+    command -v "$1" >/dev/null 2>&1
+}
+cmd_pkg_ensure() {
+    need_root
+    local p miss=""
+    for p in "$@"; do ensure_cmd_pkg "$p" "$p" || miss+=" $p"; done
+    [[ -z "$miss" ]] && return 0
+    warn "could not install:$miss"
+    pkg_fail_hint
+    return 1
+}
+fetch_to() {
+    local part="$2.part"
+    rm -f "$part"
+    if curl "${CURL_DL[@]}" "$1" -o "$part" && [[ -s "$part" ]]; then mv -f "$part" "$2"; return 0; fi
+    rm -f "$part"; return 1
+}
+
 # make sure /usr/local/bin/omnitun exists and matches this CPU
 ensure_binary() {
     [[ -x "$TSUITE_BIN" ]] && return 0
     local a; a="$(arch_tag)"; [[ "$a" == unknown ]] && die "unsupported CPU: $(uname -m)"
     local cand=""
-    for d in "$ASSET_DIR/bin" "$SCRIPT_DIR/bin"; do [[ -f "$d/omnitun-$a" ]] && cand="$d/omnitun-$a" && break; done
+    for d in "$ASSET_DIR/bin" "$SCRIPT_DIR/bin"; do [[ -s "$d/omnitun-$a" ]] && cand="$d/omnitun-$a" && break; done
     [[ -n "$cand" ]] || die "core binary omnitun-$a not found (looked in $ASSET_DIR/bin and $SCRIPT_DIR/bin). Run install.sh."
     install -m 0755 "$cand" "$TSUITE_BIN"
 }
@@ -132,7 +249,7 @@ ensure_binary() {
 # locate this box's hysteria binary (shipped in bin/, or downloadable)
 hy_local_bin() {
     local a="$1" d
-    for d in "$ASSET_DIR/bin" "$SCRIPT_DIR/bin"; do [[ -f "$d/hysteria-$a" ]] && { echo "$d/hysteria-$a"; return 0; }; done
+    for d in "$ASSET_DIR/bin" "$SCRIPT_DIR/bin"; do [[ -s "$d/hysteria-$a" ]] && { echo "$d/hysteria-$a"; return 0; }; done
     return 1
 }
 # make sure /usr/local/bin/hysteria exists for this CPU (ship-first, download-fallback)
@@ -143,8 +260,7 @@ ensure_hysteria() {
     if [[ -z "$cand" ]]; then
         info "  fetching hysteria core for $a ..."
         mkdir -p "$ASSET_DIR/bin"
-        curl -fsSL -o "$ASSET_DIR/bin/hysteria-$a" \
-            "https://github.com/apernet/hysteria/releases/download/app%2Fv2.12.0/hysteria-linux-$a" \
+        fetch_to "https://github.com/apernet/hysteria/releases/download/app%2Fv2.12.0/hysteria-linux-$a" "$ASSET_DIR/bin/hysteria-$a" \
             || die "could not obtain hysteria-$a (no shipped copy and download failed)"
         chmod +x "$ASSET_DIR/bin/hysteria-$a"; cand="$ASSET_DIR/bin/hysteria-$a"
     fi
@@ -154,7 +270,7 @@ ensure_hysteria() {
 # locate this box's chisel binary (shipped in bin/, or downloadable)
 chisel_local_bin() {
     local a="$1" d
-    for d in "$ASSET_DIR/bin" "$SCRIPT_DIR/bin"; do [[ -f "$d/chisel-$a" ]] && { echo "$d/chisel-$a"; return 0; }; done
+    for d in "$ASSET_DIR/bin" "$SCRIPT_DIR/bin"; do [[ -s "$d/chisel-$a" ]] && { echo "$d/chisel-$a"; return 0; }; done
     return 1
 }
 # make sure /usr/local/bin/chisel exists for this CPU (ship-first, download-fallback)
@@ -165,9 +281,11 @@ ensure_chisel() {
     if [[ -z "$cand" ]]; then
         info "  fetching chisel mux core for $a ..."
         mkdir -p "$ASSET_DIR/bin"
-        curl -fsSL "https://github.com/jpillora/chisel/releases/download/v$CHISEL_VER/chisel_${CHISEL_VER}_linux_$a.gz" \
-            | gzip -d > "$ASSET_DIR/bin/chisel-$a" 2>/dev/null \
-            || die "could not obtain chisel-$a (no shipped copy and download failed)"
+        fetch_to "https://github.com/jpillora/chisel/releases/download/v$CHISEL_VER/chisel_${CHISEL_VER}_linux_$a.gz" "$ASSET_DIR/bin/chisel-$a.gz" \
+            && gzip -dc "$ASSET_DIR/bin/chisel-$a.gz" > "$ASSET_DIR/bin/chisel-$a.part" 2>/dev/null \
+            && [[ -s "$ASSET_DIR/bin/chisel-$a.part" ]] && mv -f "$ASSET_DIR/bin/chisel-$a.part" "$ASSET_DIR/bin/chisel-$a" \
+            || { rm -f "$ASSET_DIR/bin/chisel-$a.gz" "$ASSET_DIR/bin/chisel-$a.part"; die "could not obtain chisel-$a (no shipped copy and download failed)"; }
+        rm -f "$ASSET_DIR/bin/chisel-$a.gz"
         chmod +x "$ASSET_DIR/bin/chisel-$a"; cand="$ASSET_DIR/bin/chisel-$a"
     fi
     install -m 0755 "$cand" "$CHISEL_BIN"
@@ -175,7 +293,7 @@ ensure_chisel() {
 
 omnistripe_local_bin() {
     local a="$1" d
-    for d in "$ASSET_DIR/bin" "$SCRIPT_DIR/bin"; do [[ -f "$d/omnistripe-$a" ]] && { echo "$d/omnistripe-$a"; return 0; }; done
+    for d in "$ASSET_DIR/bin" "$SCRIPT_DIR/bin"; do [[ -s "$d/omnistripe-$a" ]] && { echo "$d/omnistripe-$a"; return 0; }; done
     return 1
 }
 ensure_omnistripe() {
@@ -185,7 +303,7 @@ ensure_omnistripe() {
     if [[ -z "$cand" ]]; then
         info "  fetching omnistripe core for $a ..."
         mkdir -p "$ASSET_DIR/bin"
-        curl -fsSL -o "$ASSET_DIR/bin/omnistripe-$a" "$RAW_BASE/bin/omnistripe-$a" \
+        fetch_to "$RAW_BASE/bin/omnistripe-$a" "$ASSET_DIR/bin/omnistripe-$a" \
             || die "could not obtain omnistripe-$a (no shipped copy and download failed)"
         chmod +x "$ASSET_DIR/bin/omnistripe-$a"; cand="$ASSET_DIR/bin/omnistripe-$a"
     fi
@@ -194,7 +312,7 @@ ensure_omnistripe() {
 
 omniackless_local_bin() {
     local a="$1" d
-    for d in "$ASSET_DIR/bin" "$SCRIPT_DIR/bin"; do [[ -f "$d/omniackless-$a" ]] && { echo "$d/omniackless-$a"; return 0; }; done
+    for d in "$ASSET_DIR/bin" "$SCRIPT_DIR/bin"; do [[ -s "$d/omniackless-$a" ]] && { echo "$d/omniackless-$a"; return 0; }; done
     return 1
 }
 ensure_omniackless() {
@@ -204,7 +322,7 @@ ensure_omniackless() {
     if [[ -z "$cand" ]]; then
         info "  fetching omniackless core for $a ..."
         mkdir -p "$ASSET_DIR/bin"
-        curl -fsSL -o "$ASSET_DIR/bin/omniackless-$a" "$RAW_BASE/bin/omniackless-$a" \
+        fetch_to "$RAW_BASE/bin/omniackless-$a" "$ASSET_DIR/bin/omniackless-$a" \
             || die "could not obtain omniackless-$a (no shipped copy and download failed)"
         chmod +x "$ASSET_DIR/bin/omniackless-$a"; cand="$ASSET_DIR/bin/omniackless-$a"
     fi
@@ -1922,7 +2040,7 @@ alloc_and_create() {
     local afd
     mkdir -p "$INST_DIR" 2>/dev/null || true
     exec {afd}>"$INST_DIR/.alloc.lock" || die "cannot open allocation lock $INST_DIR/.alloc.lock"
-    flock "$afd" || die "cannot acquire allocation lock"
+    flock -n "$afd" 2>/dev/null || { info "another 'omnitunnel add' is running on this box - waiting for it to finish..." >&2; flock "$afd"; } || die "cannot acquire allocation lock"
     if [[ -n "$auto" ]]; then n="$(auto_name "$n")"; else inst_exists "$n" && die "instance $n exists"; fi
     ALLOC_NAME="$n"
     ALLOC_SUB=$(next_subnet_idx)
@@ -1955,6 +2073,18 @@ _peer_creds() {
         case "$k" in PEER_USER) PEER_USER="$v";; PEER_PASS) PEER_PASS="$v";; PEER_PROXY) PEER_PROXY="$v";; esac
     done < "$f"
     [[ -n "$PEER_USER" ]] || PEER_USER=root
+    return 0
+}
+peer_prepare() {
+    _peer_creds "$1"
+    [[ -n "$PEER_PASS" ]] || return 0
+    command -v sshpass >/dev/null 2>&1 && return 0
+    info "a password was given for $1 but 'sshpass' is missing here - installing it so SSH logs in by itself..."
+    pkg_install sshpass || true
+    command -v sshpass >/dev/null 2>&1 && return 0
+    warn "could not install sshpass, so ssh will ask for the foreign password at every step (about a dozen times)."
+    echo "  To avoid that, install it by hand (apt-get install -y sshpass) or set up an SSH key, then retry."
+    pkg_fail_hint
     return 0
 }
 SSH_OPTS=(-o "UserKnownHostsFile=$SSH_KNOWN_HOSTS" -o CheckHostIP=no -o LogLevel=ERROR -o ConnectTimeout=15 -o ServerAliveInterval=10 -o ServerAliveCountMax=3)
@@ -2145,33 +2275,35 @@ provision_peer() {
     lanes_ok "$lanes" || die "invalid lane count '$lanes' (want 1..64)"
     inst_name_ok "$name" || die "invalid instance name '$name'"
     cid="$(new_create_id)" || die "cannot generate a creation id for '$name'"
-    local parch; parch=$(peer_ssh "$h" "uname -m" 2>/dev/null | tr -d '\r')
+    local parch lost="lost SSH to the foreign $h while deploying; nothing was set up on this box - check the connection and retry"
+    parch=$(peer_ssh "$h" "uname -m" 2>/dev/null | tr -d '\r') \
+        || die "cannot run commands on the foreign $h over SSH (wrong user/password, no key, timeout, or a DPI-blocked path); nothing was set up - fix SSH, or use 'Add a tunnel (manual, token)' which needs no SSH, then retry"
     case "$parch" in x86_64|amd64) parch=amd64;; aarch64|arm64) parch=arm64;; *) die "peer $h has unsupported CPU: $parch";; esac
     info "  far side is $parch; deploying engine + manager to $h ..."
-    peer_ssh "$h" "mkdir -p /opt/omnitunnel/bin"
-    peer_scp "$h" "$SCRIPT_PATH" "/opt/omnitunnel/omnitunnel.sh"
-    peer_ssh "$h" "chmod +x /opt/omnitunnel/omnitunnel.sh"
+    peer_ssh "$h" "mkdir -p /opt/omnitunnel/bin" || die "$lost"
+    peer_scp "$h" "$SCRIPT_PATH" "/opt/omnitunnel/omnitunnel.sh" || die "$lost"
+    peer_ssh "$h" "chmod +x /opt/omnitunnel/omnitunnel.sh; [ -e /usr/local/bin/omnitunnel ] || ln -s /opt/omnitunnel/omnitunnel.sh /usr/local/bin/omnitunnel" || die "$lost"
     if type_is_hysteria "$t"; then
         local hbin; hbin="$(hy_local_bin "$parch" || true)"
         [[ -n "$hbin" ]] || die "no hysteria-$parch binary to send to peer"
-        peer_scp "$h" "$hbin" "/opt/omnitunnel/bin/hysteria-$parch"
-        peer_ssh "$h" "chmod +x /opt/omnitunnel/bin/hysteria-$parch; install -m0755 /opt/omnitunnel/bin/hysteria-$parch /usr/local/bin/hysteria"
+        peer_scp "$h" "$hbin" "/opt/omnitunnel/bin/hysteria-$parch" || die "$lost"
+        peer_ssh "$h" "chmod +x /opt/omnitunnel/bin/hysteria-$parch; install -m0755 /opt/omnitunnel/bin/hysteria-$parch /usr/local/bin/hysteria" || die "$lost"
     elif type_is_stripe "$t"; then
         local sbin; sbin="$(omnistripe_local_bin "$parch" || true)"
         [[ -n "$sbin" ]] || die "no omnistripe-$parch binary to send to peer"
-        peer_scp "$h" "$sbin" "/opt/omnitunnel/bin/omnistripe-$parch"
-        peer_ssh "$h" "chmod +x /opt/omnitunnel/bin/omnistripe-$parch; install -m0755 /opt/omnitunnel/bin/omnistripe-$parch /usr/local/bin/omnistripe"
+        peer_scp "$h" "$sbin" "/opt/omnitunnel/bin/omnistripe-$parch" || die "$lost"
+        peer_ssh "$h" "chmod +x /opt/omnitunnel/bin/omnistripe-$parch; install -m0755 /opt/omnitunnel/bin/omnistripe-$parch /usr/local/bin/omnistripe" || die "$lost"
     elif type_is_ackless "$t"; then
         local abin; abin="$(omniackless_local_bin "$parch" || true)"
         [[ -n "$abin" ]] || die "no omniackless-$parch binary to send to peer"
-        peer_scp "$h" "$abin" "/opt/omnitunnel/bin/omniackless-$parch"
-        peer_ssh "$h" "chmod +x /opt/omnitunnel/bin/omniackless-$parch; install -m0755 /opt/omnitunnel/bin/omniackless-$parch /usr/local/bin/omniackless"
+        peer_scp "$h" "$abin" "/opt/omnitunnel/bin/omniackless-$parch" || die "$lost"
+        peer_ssh "$h" "chmod +x /opt/omnitunnel/bin/omniackless-$parch; install -m0755 /opt/omnitunnel/bin/omniackless-$parch /usr/local/bin/omniackless" || die "$lost"
     else
         local pbin=""
         for d in "$ASSET_DIR/bin" "$SCRIPT_DIR/bin"; do [[ -f "$d/omnitun-$parch" ]] && pbin="$d/omnitun-$parch" && break; done
         [[ -n "$pbin" ]] || die "no omnitun-$parch binary to send to peer"
-        peer_scp "$h" "$pbin" "/opt/omnitunnel/bin/omnitun-$parch"
-        peer_ssh "$h" "chmod +x /opt/omnitunnel/bin/omnitun-$parch; install -m0755 /opt/omnitunnel/bin/omnitun-$parch /usr/local/bin/omnitun"
+        peer_scp "$h" "$pbin" "/opt/omnitunnel/bin/omnitun-$parch" || die "$lost"
+        peer_ssh "$h" "chmod +x /opt/omnitunnel/bin/omnitun-$parch; install -m0755 /opt/omnitunnel/bin/omnitun-$parch /usr/local/bin/omnitun" || die "$lost"
     fi
     peer_ssh "$h" "OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh _peercreate '$name' '$t' server '$plip' '$prip' '$port' '$key' '$pta' '$ppa' '$shape' '$nc' '$imode' '' '$lanes' '$cid'" \
         || die "the foreign $h did not create '$name' (see its message above); nothing was set up on this box"
@@ -2324,6 +2456,7 @@ cmd_add_auto() {
     [[ -n "$auto_kn" ]] || { inst_exists "$kn" && die "instance $kn exists"; }
     new_inst_lanes "$t"; local lanes="$NEW_LANES"
     [[ -n "${OMNITUN_PEER_PASS:-}" || -n "${OMNITUN_PEER_PROXY:-}" ]] && save_peer "$fhost" "${OMNITUN_PEER_USER:-root}" "${OMNITUN_PEER_PASS:-}" "${OMNITUN_PEER_PROXY:-}"
+    peer_prepare "$fhost"
     guard_peer_downgrade "$fhost"
     # Ask the foreign what it already runs, so a second Iran box to the SAME foreign
     # gets its own subnet/port/key (and doesn't reuse a name) instead of clobbering
@@ -2342,7 +2475,7 @@ cmd_add_auto() {
     local sub port key ta pa afd
     mkdir -p "$INST_DIR" 2>/dev/null || true
     exec {afd}>"$INST_DIR/.alloc.lock" || die "cannot open allocation lock $INST_DIR/.alloc.lock"
-    flock "$afd" || die "cannot acquire allocation lock"
+    flock -n "$afd" 2>/dev/null || { info "another 'omnitunnel add' is running on this box - waiting for it to finish..." >&2; flock "$afd"; } || die "cannot acquire allocation lock"
     if [[ -n "$auto_kn" ]]; then
         kn="$(auto_name "$t" "$fnames")"
         peer_require_absent "$fhost" "$kn"
@@ -2476,6 +2609,7 @@ wizard_add() {
     read -rsp "Far SSH password (blank = ssh key): " fp; echo
     read -erp "SOCKS5 proxy to reach the foreign, if the direct path is DPI-blocked (host:port, blank = direct): " fpx; fpx="${fpx:-${OMNITUN_PEER_PROXY:-}}"
     { [[ -n "$fp" || -n "$fpx" ]]; } && save_peer "$fhost" "$fu" "$fp" "$fpx"
+    peer_prepare "$fhost"
     guard_peer_downgrade "$fhost"
     local dn; dn="$(auto_name "$t")"; read -erp "Instance name [$dn]: " kn; kn="${kn:-$dn}"; inst_exists "$kn" && { warn "instance exists"; return; }
     local nc=16 shape=none
@@ -2545,7 +2679,7 @@ bench_ensure_iperf() {
     # install iperf3 if missing - HARD-BOUNDED so a held dpkg lock or a slow/broken
     # mirror can never hang the benchmark for hours (it used to). Non-interactive,
     # gives up on the lock after 30s and on the whole step after 100s.
-    peer_ssh "$h" "timeout 100 sh -c 'command -v iperf3 >/dev/null 2>&1 || DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=30 install -y iperf3 >/dev/null 2>&1 || yum install -y iperf3 >/dev/null 2>&1 || true'" >/dev/null 2>&1 || true
+    peer_ssh "$h" "command -v iperf3 >/dev/null 2>&1 || timeout -k 10 1200 /opt/omnitunnel/omnitunnel.sh _pkg-ensure iperf3" || true
     # then start it (each attempt bounded); bail out fast if iperf3 still isn't there
     for i in 1 2 3; do
         peer_ssh "$h" "timeout 15 sh -c '
@@ -2714,13 +2848,15 @@ bench_run() {
     read -erp "SOCKS5 proxy to reach the foreign, if the direct path is DPI-blocked (host:port, blank = direct): " fpx; fpx="${fpx:-${OMNITUN_PEER_PROXY:-}}"
     { [[ -n "$fp" || -n "$fpx" ]]; } && save_peer "$fhost" "$fu" "$fp" "$fpx"
     mylip="$(default_local_ip)"; read -erp "This box public IP [$mylip]: " x; mylip="${x:-$mylip}"
+    peer_prepare "$fhost"
     guard_peer_downgrade "$fhost"
-    command -v iperf3 >/dev/null || { warn "installing iperf3..."; apt-get install -y iperf3 >/dev/null 2>&1 || yum install -y iperf3 >/dev/null 2>&1 || true; }
+    command -v iperf3 >/dev/null || { warn "installing iperf3..."; pkg_install iperf3 || true; }
     command -v iperf3 >/dev/null || {
         echo
         warn "iperf3 is missing on THIS box and could not be auto-installed (apt may be in a broken state)."
         echo "  The benchmark can't measure without it. Install iperf3 here (fix apt, or drop a static iperf3),"
         echo "  then run the benchmark again."
+        pkg_fail_hint
         return 1
     }
 
@@ -2939,12 +3075,13 @@ cmd_bench_manual() {
     need_root; ensure_binary
     local fhost="$1" mylip="${2:-$(default_local_ip)}"
     [[ -n "$fhost" ]] || die "usage: bench-manual <foreign_ip> [my_ip]"
-    command -v iperf3 >/dev/null || { warn "installing iperf3..."; apt-get install -y iperf3 >/dev/null 2>&1 || true; }
+    command -v iperf3 >/dev/null || { warn "installing iperf3..."; pkg_install iperf3 || true; }
     command -v iperf3 >/dev/null || {
         echo
         warn "iperf3 is missing on THIS box and could not be auto-installed (apt may be in a broken state)."
         echo "  The benchmark can't measure without it. Install iperf3 here (fix apt, or drop a static iperf3),"
         echo "  then run the benchmark again."
+        pkg_fail_hint
         return 1
     }
     local ku km kt; ku=$(gen_key); km=$(gen_key); kt=$(gen_key)
@@ -3025,7 +3162,7 @@ cmd_bench_server() {
     tok_hexkey_ok "$kt" || die "invalid token: tcp key"
     ensure_binary
     B_KUDP=$ku B_KMUX=$km B_KTCP=$kt
-    command -v iperf3 >/dev/null || { apt-get install -y iperf3 >/dev/null 2>&1 || yum install -y iperf3 >/dev/null 2>&1 || true; }
+    command -v iperf3 >/dev/null || { info "installing iperf3 for the measurement server..."; pkg_install iperf3 || { warn "could not install iperf3 here - the benchmark cannot measure"; pkg_fail_hint; }; }
     systemctl reset-failed omnitun-bench-iperf 2>/dev/null || true
     systemd-run --unit=omnitun-bench-iperf --collect iperf3 -s -p 5599 >/dev/null 2>&1 || (setsid iperf3 -s -p 5599 >/dev/null 2>&1 &)
     local i=0 t
@@ -3065,7 +3202,7 @@ cmd_update() {
     local tmp; tmp="$(mktemp)"
     # cache-bust the raw CDN so a stale edge can't hand back the old install.sh
     # (which would then fetch an old manager and report "already up to date")
-    if ! curl -fsSL -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' \
+    if ! curl "${CURL_DL[@]}" -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' \
               "$RAW_BASE/install.sh?cb=$(date +%s)-${RANDOM}${RANDOM}" -o "$tmp" 2>/dev/null; then
         rm -f "$tmp"
         warn "Could not reach GitHub from this box."
@@ -3479,6 +3616,7 @@ case "${1:-menu}" in
     _postup)          cmd_postup "${2:?}";;
     _prefwd)          cmd_prefwd;;
     _peercreate)      shift; cmd_peercreate "$@";;
+    _pkg-ensure)      shift; cmd_pkg_ensure "$@";;
     forget-host)      need_root; cmd_forget_host "${2:-}" "${3:-}";;
     ensure-binary)    ensure_binary; ok "core ready at $TSUITE_BIN ($(arch_tag))";;
     fix-forwarding)   need_root; ensure_forwarding ""

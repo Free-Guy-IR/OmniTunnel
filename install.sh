@@ -39,17 +39,102 @@ OLD_CORE="$(sum_of /usr/local/bin/omnitun)"; OLD_HY="$(sum_of /usr/local/bin/hys
 # update (deps already present) never runs apt at all, and a broken *unrelated*
 # third-party repo on the box can't spew "403 / no longer signed" errors into the
 # output. When we do install, apt/yum noise is redirected away.
+PKG_LOG="${OMNI_PKG_LOG:-/var/log/omnitunnel-install.log}"
+APT_OPTS=(-o DPkg::Lock::Timeout=120 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 -o Acquire::Retries=1 -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
+DEPS=(ip iptables iperf3 ssh sshpass curl python3 nc)
+pkg_log() { printf '%s %s\n' "$(date '+%F %T')" "$*" >>"$PKG_LOG" 2>/dev/null || true; }
+pkg_run() {
+    local limit="$1"; shift
+    pkg_log "+ $*"
+    env DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPEND=1 NEEDRESTART_MODE=l APT_LISTCHANGES_FRONTEND=none \
+        timeout -k 10 "$limit" "$@" </dev/null >>"$PKG_LOG" 2>&1
+}
+dpkg_ok() { dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q 'install ok installed'; }
+stuck_debconf_pids() {
+    local d a
+    if ps -eo pid=,etimes=,args= >/dev/null 2>&1; then
+        ps -eo pid=,etimes=,args= 2>/dev/null | awk -v min="${1:-0}" '$2 >= min && $0 ~ /\/var\/lib\/dpkg\/info\/(iperf3|tzdata)\.(config|postinst) configure/ { print $1 }' || true
+        return 0
+    fi
+    for d in /proc/[0-9]*; do
+        a="$(tr '\0' ' ' <"$d/cmdline" 2>/dev/null)" || continue
+        [[ "$a" =~ /var/lib/dpkg/info/(iperf3|tzdata)\.(config|postinst)\ configure ]] && echo "${d#/proc/}"
+    done
+    return 0
+}
+dpkg_busy() {
+    local f c
+    for f in /proc/[0-9]*/comm; do
+        { read -r c <"$f"; } 2>/dev/null || continue
+        [[ "$c" == dpkg ]] && return 0
+    done
+    return 1
+}
+dpkg_broken() {
+    command -v dpkg-query >/dev/null 2>&1 || return 1
+    dpkg_busy && return 1
+    dpkg-query -W -f='${db:Status-Abbrev}\n' 2>/dev/null | grep -qE '^.[UFHWT]|^..R' && return 0
+    [[ -n "$(ls -A /var/lib/dpkg/updates 2>/dev/null)" ]]
+}
+clear_stuck_install() {
+    local pids i
+    pids="$(stuck_debconf_pids 15)"
+    [[ -n "$pids" ]] || return 0
+    echo "  an earlier package install is stuck on a hidden question (iperf3 'start as a daemon?' or tzdata 'time zone') - stopping it (pid $(echo $pids))"
+    pkg_log "stopping stuck debconf pids: $(echo $pids)"
+    kill $pids 2>/dev/null || true
+    for i in 1 2 3 4 5; do [[ -z "$(stuck_debconf_pids 0)" ]] && break; sleep 1; done
+    pids="$(stuck_debconf_pids 0)"
+    [[ -z "$pids" ]] || kill -9 $pids 2>/dev/null || true
+    for i in $(seq 1 20); do dpkg_busy || break; sleep 1; done
+}
+apt_prepare() {
+    local i
+    clear_stuck_install
+    if ! dpkg_ok iperf3 && command -v debconf-set-selections >/dev/null 2>&1; then
+        printf 'iperf3 iperf3/start_daemon boolean false\n' | debconf-set-selections >/dev/null 2>&1 || true
+    fi
+    dpkg_broken || return 0
+    echo "  repairing an interrupted package install (dpkg --configure -a)..."
+    for i in $(seq 1 24); do
+        pkg_run 300 dpkg --force-confdef --force-confold --configure -a && return 0
+        tail -n 5 "$PKG_LOG" 2>/dev/null | grep -qi 'lock' || break
+        sleep 5
+    done
+    echo "  ! could not finish the interrupted package install (see $PKG_LOG)"
+}
+apt_install() {
+    local p
+    echo "  updating package lists (apt-get update, up to 4 min)..."
+    pkg_run 240 apt-get "${APT_OPTS[@]}" update || echo "  ! apt-get update did not finish cleanly (a mirror may be unreachable) - trying the install anyway"
+    echo "  installing: $* (waits up to 2 min if another apt is running)..."
+    pkg_run 900 apt-get "${APT_OPTS[@]}" install -y --no-install-recommends "$@" && return 0
+    for p in "$@"; do
+        dpkg_ok "$p" || pkg_run 600 apt-get "${APT_OPTS[@]}" install -y --no-install-recommends "$p" || true
+    done
+}
 missing=0
-for c in ip iptables iperf3 ssh sshpass curl python3 nc; do
+for c in "${DEPS[@]}"; do
     command -v "$c" >/dev/null 2>&1 || { missing=1; break; }
 done
-if [[ $missing == 1 ]]; then
-    echo "installing dependencies..."
+repair=0
+if command -v apt-get >/dev/null 2>&1 && { [[ -n "$(stuck_debconf_pids 15)" ]] || dpkg_broken; }; then repair=1; fi
+if [[ $missing == 1 || $repair == 1 ]]; then
+    echo "installing dependencies... (details: $PKG_LOG)"
     if command -v apt-get >/dev/null; then
-        apt-get update -qq >/dev/null 2>&1 || true
-        apt-get install -y iproute2 iptables iperf3 openssh-client sshpass ca-certificates curl python3 netcat-openbsd >/dev/null 2>&1 || true
+        apt_prepare
+        [[ $missing == 1 ]] && apt_install iproute2 iptables iperf3 openssh-client sshpass ca-certificates curl python3 netcat-openbsd
     elif command -v yum >/dev/null; then
-        yum install -y iproute iptables iperf3 openssh-clients sshpass curl python3 nmap-ncat >/dev/null 2>&1 || true
+        echo "  installing with yum (up to 15 min)..."
+        pkg_run 900 yum install -y iproute iptables iperf3 openssh-clients sshpass curl python3 nmap-ncat || true
+    fi
+    still=""
+    for c in "${DEPS[@]}"; do command -v "$c" >/dev/null 2>&1 || still+=" $c"; done
+    if [[ -n "$still" ]]; then
+        echo "  ! still missing after the install:$still"
+        tail -n 12 "$PKG_LOG" 2>/dev/null | sed 's/^/    /' || true
+        echo "    full log: $PKG_LOG"
+        echo "    (iperf3 is needed only by the benchmark and sshpass only for password SSH to a foreign; the rest of OmniTunnel installs anyway)"
     fi
 fi
 
@@ -73,12 +158,29 @@ else
     # to date", so `omnitunnel update` looks like it ran but changed nothing.
     # A unique query key + no-cache headers force a fresh copy every run.
     CB="?cb=$(date +%s)-${RANDOM}${RANDOM}"; NOCACHE=(-H 'Cache-Control: no-cache' -H 'Pragma: no-cache')
-    curl -fsSL "${NOCACHE[@]}" "$RAW/bin/omnitun-$ARCH$CB" -o "$DEST/bin/omnitun-$ARCH"
-    curl -fsSL "${NOCACHE[@]}" "$RAW/omnitunnel.sh$CB"      -o "$DEST/omnitunnel.sh"
-    curl -fsSL "${NOCACHE[@]}" "$RAW/bin/hysteria-$ARCH$CB" -o "$DEST/bin/hysteria-$ARCH" || true
-    curl -fsSL "${NOCACHE[@]}" "$RAW/bin/chisel-$ARCH$CB"   -o "$DEST/bin/chisel-$ARCH" || true
-    curl -fsSL "${NOCACHE[@]}" "$RAW/bin/omnistripe-$ARCH$CB" -o "$DEST/bin/omnistripe-$ARCH" || true
-    curl -fsSL "${NOCACHE[@]}" "$RAW/bin/omniackless-$ARCH$CB" -o "$DEST/bin/omniackless-$ARCH" || true
+    CURL_OPTS=(-fL --connect-timeout 15 --retry 3 --retry-delay 3 --speed-limit 1024 --speed-time 60)
+    if [[ -t 2 ]]; then CURL_OPTS+=(--progress-bar); else CURL_OPTS+=(-sS); fi
+    fetch() {
+        local part="$2.part"
+        rm -f "$part"
+        if curl "${CURL_OPTS[@]}" "${NOCACHE[@]}" "$1" -o "$part" && [[ -s "$part" ]]; then mv -f "$part" "$2"; return 0; fi
+        rm -f "$part"; return 1
+    }
+    echo "  core engine (omnitun-$ARCH)"
+    fetch "$RAW/bin/omnitun-$ARCH$CB" "$DEST/bin/omnitun-$ARCH.new" \
+        || { echo "could not download the core from raw.githubusercontent.com (blocked or too slow from this box?) - nothing was changed"; exit 1; }
+    echo "  manager (omnitunnel.sh)"
+    fetch "$RAW/omnitunnel.sh$CB" "$DEST/omnitunnel.sh.new" \
+        || { rm -f "$DEST/bin/omnitun-$ARCH.new"; echo "could not download omnitunnel.sh from raw.githubusercontent.com - nothing was changed"; exit 1; }
+    bash -n "$DEST/omnitunnel.sh.new" 2>/dev/null \
+        || { rm -f "$DEST/bin/omnitun-$ARCH.new" "$DEST/omnitunnel.sh.new"; echo "downloaded omnitunnel.sh is not a valid script (bad mirror / captive portal?) - aborting, nothing was changed"; exit 1; }
+    mv -f "$DEST/bin/omnitun-$ARCH.new" "$DEST/bin/omnitun-$ARCH"
+    mv -f "$DEST/omnitunnel.sh.new" "$DEST/omnitunnel.sh"
+    for b in hysteria chisel omnistripe omniackless; do
+        echo "  $b engine"
+        fetch "$RAW/bin/$b-$ARCH$CB" "$DEST/bin/$b-$ARCH" \
+            || echo "  ! could not download $b-$ARCH - the $b transport tries again when it is first used"
+    done
 fi
 
 bash -n "$DEST/omnitunnel.sh" 2>/dev/null || { echo "downloaded omnitunnel.sh is not a valid script (bad mirror / captive portal?) - aborting"; exit 1; }

@@ -31,6 +31,9 @@ need_root() { :; }
 ensure_binary() { :; }
 save_peer() { :; }
 guard_peer_downgrade() { :; }
+peer_prepare() { :; }
+pkg_install() { return 1; }
+pkg_fail_hint() { :; }
 default_local_ip() { echo 10.0.0.9; }
 warn() { echo "WARN: $*"; }
 info() { echo "INFO: $*"; }

@@ -86,6 +86,23 @@ git clone https://github.com/Free-Guy-IR/OmniTunnel
 cd OmniTunnel && sudo ./install.sh && omnitunnel
 ```
 
+#### If an install got stuck or was interrupted
+
+Before v2.9.16 the installer could freeze at `installing dependencies...` (and
+the benchmark at `installing iperf3...`) on Ubuntu 24.04 and Debian 12: the
+iperf3 package asks "Start Iperf3 as a daemon automatically?", and the installer
+hid that question, so it waited for an answer forever. Pressing Ctrl+C then left
+apt locked and iperf3 half-configured, and the next run printed "Installed"
+while sshpass and the other tools were still missing.
+
+Since v2.9.16 every package install is non-interactive (the iperf3 daemon stays
+off), waits at most 2 minutes for another apt, and has time limits on the
+network. Just **run the one-liner again**: it stops the old stuck install,
+finishes the interrupted package setup (`dpkg --configure -a`) and installs what
+is missing. If something still cannot be installed (for example the box cannot
+reach any package mirror), it says which tools are missing and shows the end of
+the log; the full log is in `/var/log/omnitunnel-install.log`.
+
 ### Near-zero-config: a working tunnel in one more command
 
 You do not have to be an expert. On a fresh Iran box run the one-liner above,

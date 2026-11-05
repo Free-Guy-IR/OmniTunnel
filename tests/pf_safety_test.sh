@@ -225,7 +225,7 @@ pbefore="$(pfc "bench-$bt")"
 out="$(
     ALL_TYPES="$bt"; ASSET_DIR="$WORK/asset"; SCRIPT_DIR="$WORK/asset"; SCRIPT_PATH="$WORK/asset/omnitunnel.sh"
     mkdir -p "$ASSET_DIR/bin"; : > "$ASSET_DIR/bin/omnitun-amd64"
-    ensure_binary() { :; }; save_peer() { :; }; default_local_ip() { echo 192.0.2.1; }; guard_peer_downgrade() { :; }
+    ensure_binary() { :; }; save_peer() { :; }; default_local_ip() { echo 192.0.2.1; }; guard_peer_downgrade() { :; }; peer_prepare() { :; }
     iperf3() { return 1; }
     peer_ssh() { [[ "${2:-}" == "uname -m" ]] && echo x86_64; return 0; }
     peer_scp() { :; }; hy_local_bin() { return 1; }; omnistripe_local_bin() { return 1; }; omniackless_local_bin() { return 1; }

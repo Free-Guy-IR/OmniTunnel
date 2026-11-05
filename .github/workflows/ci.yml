@@ -145,6 +145,28 @@ jobs:
           sudo bash tests/ssh_modern_race_test.sh | tee /tmp/ssh_modern_race_test.out
           grep -q '^PASSED - ssh_modern_race_test' /tmp/ssh_modern_race_test.out
 
+  installer-real-os:
+    name: installer on ${{ matrix.image }} (${{ matrix.scenario }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { image: 'ubuntu:22.04', scenario: fresh }
+          - { image: 'ubuntu:24.04', scenario: fresh }
+          - { image: 'debian:12', scenario: fresh }
+          - { image: 'ubuntu:24.04', scenario: interrupted }
+          - { image: 'debian:12', scenario: interrupted }
+          - { image: 'ubuntu:24.04', scenario: manager-interrupted }
+          - { image: 'ubuntu:24.04', scenario: no-mirror }
+    steps:
+      - uses: actions/checkout@v4
+      - name: install.sh in a real container with a terminal (root, docker)
+        run: |
+          set -eo pipefail
+          sudo OT_REAL_OS=1 OT_IMAGE='${{ matrix.image }}' OT_SCENARIO='${{ matrix.scenario }}' bash tests/install_real_os_test.sh | tee /tmp/install_real_os_test.out
+          grep -qE '^(PASSED|SKIPPED) - install_real_os_test' /tmp/install_real_os_test.out
+
   direct-c:
     name: C core (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
