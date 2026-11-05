@@ -156,7 +156,7 @@ if [[ -d /proc/self ]] && command -v python3 >/dev/null 2>&1; then
         [[ " $got " != *" $S3 "* ]] || { kill "$S1" "$S2" "$S3" 2>/dev/null; fail "[$mode] a configure step that is busy running (not sleeping) must not be treated as stuck (got: $got)"; }
         pass
     done
-    kill "$S1" "$S2" "$S3" 2>/dev/null; wait "$S1" "$S2" "$S3" 2>/dev/null
+    kill "$S1" "$S2" "$S3" 2>/dev/null
 fi
 
 peer() {
@@ -247,16 +247,17 @@ if command -v python3 >/dev/null 2>&1 && command -v curl >/dev/null 2>&1; then
             echo keep > "$T/keep"
             get "http://127.0.0.1:$PORT/missing.bin" "$T/keep" 2>/dev/null || true
             [[ "$(cat "$T/keep")" == keep ]] && echo OK5
-            for i in 1 2 3 4 5 6 7 8; do get "http://127.0.0.1:$PORT/file.bin" "$T/con" & done; wait
-            cmp -s "$T/con" "$WEB/file.bin" && ! ls "$T" | grep -q '\.part' && echo OK6
+            for i in 1 2 3 4 5 6 7 8; do ( get "http://127.0.0.1:$PORT/file.bin" "$T/con"; : > "$T/done-$i" ) & done
+            for _ in $(seq 1 300); do [[ "$(ls "$T" | grep -c '^done-')" -ge 8 ]] && break; builtin command sleep 0.1; done
+            [[ "$(ls "$T" | grep -c '^done-')" -ge 8 ]] && cmp -s "$T/con" "$WEB/file.bin" && ! ls "$T" | grep -q '\.part' && echo OK6
         )"
         for k in OK1 OK2 OK3 OK4 OK5 OK6; do grep -qx "$k" <<< "$out" || fail "$impl download helper check $k failed (OK1 good file lands intact, OK2 no .part left, OK3 a 404 fails, OK4 a failed download creates nothing, OK5 a failed download keeps the existing file, OK6 eight concurrent downloads of one file leave it intact): $out"; done
         pass
     done
     GZ="$D/chisel.gz"; printf 'chisel-binary-%s\n' "$(seq 1 3000 | tr '\n' ' ')" > "$D/chisel.raw"; gzip -c "$D/chisel.raw" > "$GZ"
-    CA="$D/chisel-assets"; mkdir -p "$CA/bin"; CPIDS=()
+    CA="$D/chisel-assets"; mkdir -p "$CA/bin"
     for i in 1 2 3 4 5 6 7 8; do
-        (
+        ( (
             eval "$(extract_from "$SCRIPT" "chisel_local_bin ensure_chisel")"
             arch_tag() { echo amd64; }
             info() { :; }
@@ -264,10 +265,10 @@ if command -v python3 >/dev/null 2>&1 && command -v curl >/dev/null 2>&1; then
             fetch_to() { builtin command sleep 0.$((RANDOM % 5)); cp "$GZ" "$2"; }
             ASSET_DIR="$CA"; SCRIPT_DIR="$D/none"; CHISEL_BIN="$D/chisel-bin-$i"; CHISEL_VER=1.10.1
             ensure_chisel && cmp -s "$CHISEL_BIN" "$D/chisel.raw" && echo "OKC$i" > "$D/chisel-ok-$i"
-        ) 2>"$D/chisel-err-$i" &
-        CPIDS+=("$!")
+        ) 2>"$D/chisel-err-$i"; : > "$D/chisel-done-$i" ) &
     done
-    wait "${CPIDS[@]}"
+    for _ in $(seq 1 600); do [[ "$(ls "$D" | grep -c '^chisel-done-')" -ge 8 ]] && break; builtin command sleep 0.1; done
+    [[ "$(ls "$D" | grep -c '^chisel-done-')" -ge 8 ]] || fail "the eight concurrent ensure_chisel runs did not all finish within 60 s"
     for i in 1 2 3 4 5 6 7 8; do [[ -f "$D/chisel-ok-$i" ]] || fail "concurrent first-time ensure_chisel run $i failed: $(cat "$D/chisel-err-$i")"; done
     cmp -s "$CA/bin/chisel-amd64" "$D/chisel.raw" || fail "the published chisel binary is not the decompressed download"
     ! ls "$CA/bin" | grep -qE '\.(gz|part)\.' || fail "concurrent ensure_chisel left staging files behind: $(ls "$CA/bin")"
