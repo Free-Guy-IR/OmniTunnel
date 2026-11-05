@@ -16,6 +16,17 @@ BINLINK="/usr/local/bin/omnitunnel"
 
 [[ $EUID -eq 0 ]] || { echo "run as root"; exit 1; }
 
+INSTALL_LOCK_FD=""
+if command -v flock >/dev/null 2>&1; then
+    { exec {INSTALL_LOCK_FD}>/run/omnitunnel-install.lock; } 2>/dev/null \
+        || { exec {INSTALL_LOCK_FD}>/tmp/omnitunnel-install.lock; } 2>/dev/null \
+        || INSTALL_LOCK_FD=""
+fi
+if [[ -n "$INSTALL_LOCK_FD" ]] && ! flock -n "$INSTALL_LOCK_FD"; then
+    echo "another OmniTunnel install or update is running on this box - waiting for it to finish (up to 15 min)..."
+    flock -w 900 "$INSTALL_LOCK_FD" || { echo "the other install did not finish within 15 minutes - nothing was changed; try again later"; exit 1; }
+fi
+
 case "$(uname -m)" in
     x86_64|amd64) ARCH=amd64;;
     aarch64|arm64) ARCH=arm64;;
@@ -44,24 +55,44 @@ APT_OPTS=(-o DPkg::Lock::Timeout=120 -o Acquire::http::Timeout=20 -o Acquire::ht
 DEPS=(ip iptables iperf3 ssh sshpass curl python3 nc)
 pkg_log() { printf '%s %s\n' "$(date '+%F %T')" "$*" >>"$PKG_LOG" 2>/dev/null || true; }
 pkg_run() {
-    local limit="$1"; shift
+    local limit="$1" rc=0 out=""; shift
     pkg_log "+ $*"
-    PKG_MARK="$(wc -c 2>/dev/null <"$PKG_LOG" || echo 0)"
-    env DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPEND=1 NEEDRESTART_MODE=l APT_LISTCHANGES_FRONTEND=none \
-        timeout -k 10 "$limit" "$@" </dev/null >>"$PKG_LOG" 2>&1
-}
-pkg_log_locked() { tail -c +"$(( ${PKG_MARK:-0} + 1 ))" "$PKG_LOG" 2>/dev/null | grep -qiE 'could not get lock|locked by another process|unable to acquire the dpkg'; }
-dpkg_ok() { dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q 'install ok installed'; }
-stuck_debconf_pids() {
-    local d a
-    if ps -eo pid=,etimes=,args= >/dev/null 2>&1; then
-        ps -eo pid=,etimes=,args= 2>/dev/null | awk -v min="${1:-0}" '$2 >= min && $0 ~ /\/var\/lib\/dpkg\/info\/(iperf3|tzdata)\.(config|postinst) configure/ { print $1 }' || true
-        return 0
+    PKG_LOCKED=0
+    out="$(mktemp "${TMPDIR:-/tmp}/omnitunnel-pkg.XXXXXX" 2>/dev/null)" || out=""
+    if [[ -z "$out" ]]; then
+        env DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPEND=1 NEEDRESTART_MODE=l APT_LISTCHANGES_FRONTEND=none \
+            timeout -k 10 "$limit" "$@" </dev/null >>"$PKG_LOG" 2>&1 || rc=$?
+        return "$rc"
     fi
-    for d in /proc/[0-9]*; do
-        a="$(tr '\0' ' ' <"$d/cmdline" 2>/dev/null)" || continue
-        [[ "$a" =~ /var/lib/dpkg/info/(iperf3|tzdata)\.(config|postinst)\ configure ]] && echo "${d#/proc/}"
-    done
+    env DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPEND=1 NEEDRESTART_MODE=l APT_LISTCHANGES_FRONTEND=none \
+        timeout -k 10 "$limit" "$@" </dev/null >"$out" 2>&1 || rc=$?
+    cat "$out" >>"$PKG_LOG" 2>/dev/null || true
+    grep -qiE 'could not get lock|locked by another process|unable to acquire the dpkg' "$out" && PKG_LOCKED=1
+    rm -f "$out"
+    return "$rc"
+}
+pkg_log_locked() { [[ "${PKG_LOCKED:-0}" == 1 ]]; }
+dpkg_ok() { dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q 'install ok installed'; }
+pkg_waits_for_input() {
+    local st env
+    st="$(cat "/proc/$1/stat" 2>/dev/null)" || return 1
+    st="${st##*) }"
+    [[ "${st%% *}" == S ]] || return 1
+    env="$(tr '\0' '\n' 2>/dev/null <"/proc/$1/environ")" || return 0
+    grep -qx 'DEBIAN_FRONTEND=noninteractive' <<<"$env" && return 1
+    return 0
+}
+stuck_debconf_pids() {
+    local d a p cand=""
+    if ps -eo pid=,etimes=,args= >/dev/null 2>&1; then
+        cand="$(ps -eo pid=,etimes=,args= 2>/dev/null | awk -v min="${1:-0}" '$2 >= min && $0 ~ /\/var\/lib\/dpkg\/info\/(iperf3|tzdata)\.(config|postinst) configure/ { print $1 }')" || cand=""
+    else
+        for d in /proc/[0-9]*; do
+            a="$(tr '\0' ' ' 2>/dev/null <"$d/cmdline")" || continue
+            [[ "$a" =~ /var/lib/dpkg/info/(iperf3|tzdata)\.(config|postinst)\ configure ]] && cand+="${d#/proc/} "
+        done
+    fi
+    for p in $cand; do pkg_waits_for_input "$p" && echo "$p"; done
     return 0
 }
 dpkg_busy() {

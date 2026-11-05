@@ -126,28 +126,48 @@ OMNI_APT_UPDATED=0
 CURL_DL=(-fL --connect-timeout 15 --retry 3 --retry-delay 3 --speed-limit 1024 --speed-time 60 -sS)
 pkg_log() { printf '%s %s\n' "$(date '+%F %T')" "$*" >>"$OMNI_PKG_LOG" 2>/dev/null || true; }
 pkg_run() {
-    local limit="$1"; shift
+    local limit="$1" rc=0 out=""; shift
     pkg_log "+ $*"
-    OMNI_PKG_MARK="$(wc -c 2>/dev/null <"$OMNI_PKG_LOG" || echo 0)"
+    OMNI_PKG_LOCKED=0
+    out="$(mktemp "${TMPDIR:-/tmp}/omnitunnel-pkg.XXXXXX" 2>/dev/null)" || out=""
+    if [[ -z "$out" ]]; then
+        env DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPEND=1 NEEDRESTART_MODE=l APT_LISTCHANGES_FRONTEND=none \
+            timeout -k 10 "$limit" "$@" </dev/null >>"$OMNI_PKG_LOG" 2>&1 || rc=$?
+        return "$rc"
+    fi
     env DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPEND=1 NEEDRESTART_MODE=l APT_LISTCHANGES_FRONTEND=none \
-        timeout -k 10 "$limit" "$@" </dev/null >>"$OMNI_PKG_LOG" 2>&1
+        timeout -k 10 "$limit" "$@" </dev/null >"$out" 2>&1 || rc=$?
+    cat "$out" >>"$OMNI_PKG_LOG" 2>/dev/null || true
+    grep -qiE 'could not get lock|locked by another process|unable to acquire the dpkg' "$out" && OMNI_PKG_LOCKED=1
+    rm -f "$out"
+    return "$rc"
 }
 pkg_fail_hint() {
     tail -n 40 "$OMNI_PKG_LOG" 2>/dev/null | uniq | tail -n 12 | sed 's/^/    /' || true
     echo "    full log: $OMNI_PKG_LOG"
 }
-pkg_log_locked() { tail -c +"$(( ${OMNI_PKG_MARK:-0} + 1 ))" "$OMNI_PKG_LOG" 2>/dev/null | grep -qiE 'could not get lock|locked by another process|unable to acquire the dpkg'; }
+pkg_log_locked() { [[ "${OMNI_PKG_LOCKED:-0}" == 1 ]]; }
 dpkg_ok() { dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q 'install ok installed'; }
+pkg_waits_for_input() {
+    local st env
+    st="$(cat "/proc/$1/stat" 2>/dev/null)" || return 1
+    st="${st##*) }"
+    [[ "${st%% *}" == S ]] || return 1
+    env="$(tr '\0' '\n' 2>/dev/null <"/proc/$1/environ")" || return 0
+    grep -qx 'DEBIAN_FRONTEND=noninteractive' <<<"$env" && return 1
+    return 0
+}
 stuck_debconf_pids() {
-    local d a
+    local d a p cand=""
     if ps -eo pid=,etimes=,args= >/dev/null 2>&1; then
-        ps -eo pid=,etimes=,args= 2>/dev/null | awk -v min="${1:-0}" '$2 >= min && $0 ~ /\/var\/lib\/dpkg\/info\/(iperf3|tzdata)\.(config|postinst) configure/ { print $1 }' || true
-        return 0
+        cand="$(ps -eo pid=,etimes=,args= 2>/dev/null | awk -v min="${1:-0}" '$2 >= min && $0 ~ /\/var\/lib\/dpkg\/info\/(iperf3|tzdata)\.(config|postinst) configure/ { print $1 }')" || cand=""
+    else
+        for d in /proc/[0-9]*; do
+            a="$(tr '\0' ' ' 2>/dev/null <"$d/cmdline")" || continue
+            [[ "$a" =~ /var/lib/dpkg/info/(iperf3|tzdata)\.(config|postinst)\ configure ]] && cand+="${d#/proc/} "
+        done
     fi
-    for d in /proc/[0-9]*; do
-        a="$(tr '\0' ' ' <"$d/cmdline" 2>/dev/null)" || continue
-        [[ "$a" =~ /var/lib/dpkg/info/(iperf3|tzdata)\.(config|postinst)\ configure ]] && echo "${d#/proc/}"
-    done
+    for p in $cand; do pkg_waits_for_input "$p" && echo "$p"; done
     return 0
 }
 dpkg_busy() {
@@ -309,13 +329,14 @@ ensure_chisel() {
     if [[ -z "$cand" ]]; then
         info "  fetching chisel mux core for $a ..."
         mkdir -p "$ASSET_DIR/bin"
-        local cpart=""
-        fetch_to "https://github.com/jpillora/chisel/releases/download/v$CHISEL_VER/chisel_${CHISEL_VER}_linux_$a.gz" "$ASSET_DIR/bin/chisel-$a.gz" \
+        local cgz="" cpart=""
+        cgz="$(mktemp "$ASSET_DIR/bin/chisel-$a.gz.XXXXXX")" \
+            && fetch_to "https://github.com/jpillora/chisel/releases/download/v$CHISEL_VER/chisel_${CHISEL_VER}_linux_$a.gz" "$cgz" \
             && cpart="$(mktemp "$ASSET_DIR/bin/chisel-$a.part.XXXXXX")" \
-            && gzip -dc "$ASSET_DIR/bin/chisel-$a.gz" > "$cpart" 2>/dev/null \
-            && [[ -s "$cpart" ]] && mv -f "$cpart" "$ASSET_DIR/bin/chisel-$a" \
-            || { rm -f "$ASSET_DIR/bin/chisel-$a.gz" ${cpart:+"$cpart"}; die "could not obtain chisel-$a (no shipped copy and download failed)"; }
-        rm -f "$ASSET_DIR/bin/chisel-$a.gz"
+            && gzip -dc "$cgz" > "$cpart" 2>/dev/null \
+            && [[ -s "$cpart" ]] && chmod 0644 "$cpart" && mv -f "$cpart" "$ASSET_DIR/bin/chisel-$a" \
+            || { rm -f ${cgz:+"$cgz"} ${cpart:+"$cpart"}; die "could not obtain chisel-$a (no shipped copy and download failed)"; }
+        rm -f "$cgz"
         chmod +x "$ASSET_DIR/bin/chisel-$a"; cand="$ASSET_DIR/bin/chisel-$a"
     fi
     install -m 0755 "$cand" "$CHISEL_BIN"

@@ -32,6 +32,7 @@ cat > "$BIN/apt-get" <<'EOF'
 #!/bin/bash
 printf 'apt-get|%s|%s|%s|%s\n' "${DEBIAN_FRONTEND:-}" "${NEEDRESTART_SUSPEND:-}" "$(readlink /proc/self/fd/0 2>/dev/null || echo '?')" "$*" >> "$CALLS"
 [[ -f "$CALLS.apt_lock" ]] && { echo "E: Could not get lock /var/lib/dpkg/lock-frontend. It is held by process 99 (apt-get)"; exit 100; }
+[[ -f "$CALLS.apt_fail_other" ]] && { echo "E: Could not get lock /var/lib/dpkg/lock-frontend. It is held by process 77 (apt-get)" >> "$OMNI_PKG_LOG"; echo "E: Unable to locate package"; exit 100; }
 [[ -f "$CALLS.apt_fail" ]] && exit 100
 exit 0
 EOF
@@ -131,6 +132,33 @@ rm -f "$CALLS.apt_fail"
 grep -q ' install -y --no-install-recommends iperf3$' "$CALLS" && grep -q ' install -y --no-install-recommends sshpass$' "$CALLS" || fail "after a failed transaction each package must be retried on its own: $(cat "$CALLS")"
 pass
 
+: > "$CALLS"; touch "$CALLS.apt_fail_other"
+out="$(run_pkg pkg_install iperf3 sshpass 2>&1)"; rc=$?
+rm -f "$CALLS.apt_fail_other"
+[[ "$(grep -c ' install -y ' "$CALLS")" == 3 ]] || fail "a lock message written to the shared log by another install while this one failed for a different reason must not count as this run's lock (expected the transaction plus 2 per-package retries): $(cat "$CALLS")"
+pass
+
+if [[ -d /proc/self ]] && command -v python3 >/dev/null 2>&1; then
+    S1=""; S2=""; S3=""
+    env -u DEBIAN_FRONTEND python3 -c 'import time; time.sleep(60)' /var/lib/dpkg/info/iperf3.config configure & S1=$!
+    DEBIAN_FRONTEND=noninteractive python3 -c 'import time; time.sleep(60)' /var/lib/dpkg/info/tzdata.config configure & S2=$!
+    env -u DEBIAN_FRONTEND python3 -c 'while True: pass' /var/lib/dpkg/info/iperf3.postinst configure & S3=$!
+    builtin command sleep 1
+    for mode in ps proc; do
+        got="$(
+            eval "$(extract_from "$SCRIPT" "pkg_waits_for_input stuck_debconf_pids")"
+            [[ "$mode" == proc ]] && ps() { return 1; }
+            stuck_debconf_pids 0
+        )"
+        got="$(tr '\n' ' ' <<< "$got")"
+        [[ " $got " == *" $S1 "* ]] || { kill "$S1" "$S2" "$S3" 2>/dev/null; fail "[$mode] a process waiting in an interactive debconf script must be found as stuck (got: $got)"; }
+        [[ " $got " != *" $S2 "* ]] || { kill "$S1" "$S2" "$S3" 2>/dev/null; fail "[$mode] a configure step running with DEBIAN_FRONTEND=noninteractive cannot be waiting for an answer and must never be treated as stuck (got: $got)"; }
+        [[ " $got " != *" $S3 "* ]] || { kill "$S1" "$S2" "$S3" 2>/dev/null; fail "[$mode] a configure step that is busy running (not sleeping) must not be treated as stuck (got: $got)"; }
+        pass
+    done
+    kill "$S1" "$S2" "$S3" 2>/dev/null; wait "$S1" "$S2" "$S3" 2>/dev/null
+fi
+
 peer() {
     (
         eval "$(extract_from "$SCRIPT" "peer_conf save_peer _peer_creds peer_prepare")"
@@ -225,8 +253,27 @@ if command -v python3 >/dev/null 2>&1 && command -v curl >/dev/null 2>&1; then
         for k in OK1 OK2 OK3 OK4 OK5 OK6; do grep -qx "$k" <<< "$out" || fail "$impl download helper check $k failed (OK1 good file lands intact, OK2 no .part left, OK3 a 404 fails, OK4 a failed download creates nothing, OK5 a failed download keeps the existing file, OK6 eight concurrent downloads of one file leave it intact): $out"; done
         pass
     done
+    GZ="$D/chisel.gz"; printf 'chisel-binary-%s\n' "$(seq 1 3000 | tr '\n' ' ')" > "$D/chisel.raw"; gzip -c "$D/chisel.raw" > "$GZ"
+    CA="$D/chisel-assets"; mkdir -p "$CA/bin"; CPIDS=()
+    for i in 1 2 3 4 5 6 7 8; do
+        (
+            eval "$(extract_from "$SCRIPT" "chisel_local_bin ensure_chisel")"
+            arch_tag() { echo amd64; }
+            info() { :; }
+            die() { echo "DIE: $*" >&2; exit 1; }
+            fetch_to() { builtin command sleep 0.$((RANDOM % 5)); cp "$GZ" "$2"; }
+            ASSET_DIR="$CA"; SCRIPT_DIR="$D/none"; CHISEL_BIN="$D/chisel-bin-$i"; CHISEL_VER=1.10.1
+            ensure_chisel && cmp -s "$CHISEL_BIN" "$D/chisel.raw" && echo "OKC$i" > "$D/chisel-ok-$i"
+        ) 2>"$D/chisel-err-$i" &
+        CPIDS+=("$!")
+    done
+    wait "${CPIDS[@]}"
+    for i in 1 2 3 4 5 6 7 8; do [[ -f "$D/chisel-ok-$i" ]] || fail "concurrent first-time ensure_chisel run $i failed: $(cat "$D/chisel-err-$i")"; done
+    cmp -s "$CA/bin/chisel-amd64" "$D/chisel.raw" || fail "the published chisel binary is not the decompressed download"
+    ! ls "$CA/bin" | grep -qE '\.(gz|part)\.' || fail "concurrent ensure_chisel left staging files behind: $(ls "$CA/bin")"
+    pass
 else
     echo "NOTE: python3 or curl missing - download checks skipped"
 fi
 
-echo "PASSED - install_hang_wiring_test: $checks checks - package installs run non-interactively with stdin from /dev/null and bounded locks, iperf3's daemon question is preseeded to false, an interrupted dpkg is repaired and a stuck hidden earlier install is stopped first (an apt asking in an open terminal is left alone), failed transactions retry per package except on a held lock, a saved password installs sshpass (or explains why not), SSH failures in provision_peer are reported instead of a silent exit, and downloads never leave partial or empty files, even when run concurrently"
+echo "PASSED - install_hang_wiring_test: $checks checks - package installs run non-interactively with stdin from /dev/null and bounded locks, iperf3's daemon question is preseeded to false, an interrupted dpkg is repaired and a stuck hidden earlier install is stopped first (an apt asking in an open terminal is left alone), only a sleeping interactive question is ever treated as stuck (never a noninteractive or busy configure step), failed transactions retry per package except on this run's own held lock (a lock line another install writes into the shared log does not count), a saved password installs sshpass (or explains why not), SSH failures in provision_peer are reported instead of a silent exit, and downloads never leave partial or empty files, even when run concurrently (including eight concurrent first-time chisel fetches)"

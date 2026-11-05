@@ -146,7 +146,7 @@ jobs:
           grep -q '^PASSED - ssh_modern_race_test' /tmp/ssh_modern_race_test.out
 
   installer-real-os:
-    name: installer on ${{ matrix.image }} (${{ matrix.scenario }})
+    name: installer on ${{ matrix.image }} (${{ matrix.scenario }} ${{ matrix.docker_args }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -156,15 +156,17 @@ jobs:
           - { image: 'ubuntu:24.04', scenario: fresh }
           - { image: 'debian:12', scenario: fresh }
           - { image: 'ubuntu:24.04', scenario: interrupted }
+          - { image: 'ubuntu:24.04', scenario: interrupted, docker_args: '--cap-add SYS_PTRACE' }
           - { image: 'debian:12', scenario: interrupted }
           - { image: 'ubuntu:24.04', scenario: manager-interrupted }
           - { image: 'ubuntu:24.04', scenario: no-mirror }
+          - { image: 'ubuntu:24.04', scenario: concurrent }
     steps:
       - uses: actions/checkout@v4
       - name: install.sh in a real container with a terminal (root, docker)
         run: |
           set -eo pipefail
-          sudo OT_REAL_OS=1 OT_IMAGE='${{ matrix.image }}' OT_SCENARIO='${{ matrix.scenario }}' bash tests/install_real_os_test.sh | tee /tmp/install_real_os_test.out
+          sudo OT_REAL_OS=1 OT_IMAGE='${{ matrix.image }}' OT_SCENARIO='${{ matrix.scenario }}' OT_DOCKER_ARGS='${{ matrix.docker_args }}' bash tests/install_real_os_test.sh | tee /tmp/install_real_os_test.out
           grep -qE '^(PASSED|SKIPPED) - install_real_os_test' /tmp/install_real_os_test.out
 
   direct-c:

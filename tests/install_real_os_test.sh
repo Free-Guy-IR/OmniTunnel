@@ -17,7 +17,7 @@ LOG="$(mktemp)"
 
 case "$(uname -m)" in x86_64|amd64) ARCH=amd64;; aarch64|arm64) ARCH=arm64;; *) echo "FAIL: unsupported CPU $(uname -m)"; exit 1;; esac
 
-cleanup() { docker rm -f "$NAME" >/dev/null 2>&1 || true; rm -f "$LOG"; }
+cleanup() { docker rm -f "$NAME" >/dev/null 2>&1 || true; rm -f "$LOG" "$LOG.b" "$LOG.brc"; }
 trap cleanup EXIT
 
 in_box() { docker exec "$NAME" sh -c "$1"; }
@@ -96,8 +96,8 @@ run_limited() {
 }
 
 step "starting a clean $IMAGE container with a terminal"
-DOCKER_EXTRA=()
-[[ "$SCENARIO" == no-mirror ]] && DOCKER_EXTRA=(--dns 192.0.2.1)
+read -r -a DOCKER_EXTRA <<< "${OT_DOCKER_ARGS:-}"
+[[ "$SCENARIO" == no-mirror ]] && DOCKER_EXTRA+=(--dns 192.0.2.1)
 docker run -d -t --memory 512m ${DOCKER_EXTRA[@]+"${DOCKER_EXTRA[@]}"} --name "$NAME" "$IMAGE" sleep "$((LIMIT * 3 + 600))" >/dev/null || fail "cannot start $IMAGE"
 in_box 'mkdir -p /tmp/ot/bin' || fail "cannot prepare /tmp/ot"
 docker cp "$INSTALLER" "$NAME:/tmp/ot/install.sh" >/dev/null || fail "cannot copy the installer"
@@ -112,6 +112,15 @@ case "$SCENARIO" in
     fresh)
         step "running install.sh on a fresh box"
         run_limited bash /tmp/ot/install.sh || fail "install.sh exited non-zero"
+        ;;
+    concurrent)
+        step "running two install.sh at the same time on a fresh box"
+        ( timeout "$LIMIT" docker exec -t "$NAME" bash /tmp/ot/install.sh >"$LOG.b" 2>&1; echo "$?" >"$LOG.brc" ) &
+        bpid=$!
+        run_limited bash /tmp/ot/install.sh || fail "the first install.sh exited non-zero"
+        wait "$bpid"
+        [[ "$(cat "$LOG.brc" 2>/dev/null)" == 0 ]] || fail "the second install.sh exited non-zero: $(tail -n 8 "$LOG.b" 2>/dev/null)"
+        grep -q 'another OmniTunnel install or update is running' "$LOG" "$LOG.b" || fail "neither run reported that it waited for the other"
         ;;
     interrupted)
         make_interrupted_state
