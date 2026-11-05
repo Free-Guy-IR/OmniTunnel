@@ -31,6 +31,7 @@ CALLS="$D/calls"; : > "$CALLS"
 cat > "$BIN/apt-get" <<'EOF'
 #!/bin/bash
 printf 'apt-get|%s|%s|%s|%s\n' "${DEBIAN_FRONTEND:-}" "${NEEDRESTART_SUSPEND:-}" "$(readlink /proc/self/fd/0 2>/dev/null || echo '?')" "$*" >> "$CALLS"
+[[ -f "$CALLS.apt_lock" ]] && { echo "E: Could not get lock /var/lib/dpkg/lock-frontend. It is held by process 99 (apt-get)"; exit 100; }
 [[ -f "$CALLS.apt_fail" ]] && exit 100
 exit 0
 EOF
@@ -67,14 +68,15 @@ done
 
 run_pkg() {
     (
-        eval "$(extract_from "$SCRIPT" "pkg_log pkg_run pkg_fail_hint dpkg_ok stuck_debconf_pids dpkg_busy dpkg_broken clear_stuck_install apt_prepare pkg_install")"
+        eval "$(extract_from "$SCRIPT" "pkg_log pkg_run pkg_log_locked pkg_fail_hint dpkg_ok stuck_debconf_pids dpkg_busy dpkg_broken apt_owner_hidden clear_stuck_install apt_prepare pkg_install")"
         eval "$(grep -m1 '^OMNI_APT_OPTS=' "$SCRIPT")"
         OMNI_APT_PREPARED=0; OMNI_APT_UPDATED=0
         info() { echo "INFO: $*"; }
         warn() { echo "WARN: $*"; }
-        kill() { echo "kill|$*" >> "$CALLS"; }
+        kill() { echo "kill|$*" >> "$CALLS"; [[ "${1:-}" == -0 ]] && return 1; return 0; }
         sleep() { :; }
-        stuck_debconf_pids() { if [[ -f "$D/stuck" ]]; then cat "$D/stuck"; [[ "${1:-0}" == 0 ]] && rm -f "$D/stuck"; fi; return 0; }
+        stuck_debconf_pids() { [[ -f "$D/stuck" ]] && cat "$D/stuck"; return 0; }
+        apt_owner_hidden() { [[ ! -f "$D/shown" ]]; }
         dpkg_busy() { return 1; }
         dpkg_broken() { [[ -f "$D/broken" ]]; }
         "$@"
@@ -105,6 +107,21 @@ rm -f "$D/stuck"
 grep -qx 'kill|4242' "$CALLS" || fail "a package question left pending by an earlier interrupted install must be stopped: $(cat "$CALLS")"
 grep -q 'stuck on a hidden question' <<< "$out" || fail "stopping the stuck install must be announced: $out"
 [[ "$(grep -n '^kill|' "$CALLS" | head -1 | cut -d: -f1)" -lt "$(grep -n ' install -y ' "$CALLS" | head -1 | cut -d: -f1)" ]] || fail "the stuck install must be stopped before the new install"
+grep -q '^kill|-9' "$CALLS" && fail "a stuck install that exited on TERM must not get a KILL: $(cat "$CALLS")"
+pass
+
+: > "$CALLS"; echo 4343 > "$D/stuck"; touch "$D/shown"
+out="$(run_pkg pkg_install iperf3 2>&1)"; rc=$?
+rm -f "$D/stuck" "$D/shown"
+grep -q '^kill|' "$CALLS" && fail "an apt that is asking its question in an open terminal must not be killed: $(cat "$CALLS")"
+grep -q 'waiting for an answer in an open terminal (pid 4343)' <<< "$out" || fail "an apt waiting in an open terminal must be pointed out to the user: $out"
+pass
+
+: > "$CALLS"; touch "$CALLS.apt_lock"
+out="$(run_pkg pkg_install iperf3 sshpass 2>&1)"; rc=$?
+rm -f "$CALLS.apt_lock"
+[[ $rc -ne 0 ]] || fail "pkg_install must fail while another apt holds the lock"
+[[ "$(grep -c ' install -y ' "$CALLS")" == 1 ]] || fail "a lock failure must not be retried package by package (each retry would wait for the lock again): $(cat "$CALLS")"
 pass
 
 : > "$CALLS"; touch "$CALLS.apt_fail"
@@ -196,18 +213,20 @@ if command -v python3 >/dev/null 2>&1 && command -v curl >/dev/null 2>&1; then
             CURL_DL=(-fL --connect-timeout 15 --retry 0 -sS)
             T="$D/dl-$impl"; mkdir -p "$T"
             get "http://127.0.0.1:$PORT/file.bin" "$T/ok" && cmp -s "$T/ok" "$WEB/file.bin" && echo OK1
-            [[ ! -e "$T/ok.part" ]] && echo OK2
+            ! ls "$T" | grep -q '\.part' && echo OK2
             get "http://127.0.0.1:$PORT/missing.bin" "$T/missing" 2>/dev/null || echo OK3
-            [[ ! -e "$T/missing" && ! -e "$T/missing.part" ]] && echo OK4
+            [[ ! -e "$T/missing" ]] && ! ls "$T" | grep -q '\.part' && echo OK4
             echo keep > "$T/keep"
             get "http://127.0.0.1:$PORT/missing.bin" "$T/keep" 2>/dev/null || true
             [[ "$(cat "$T/keep")" == keep ]] && echo OK5
+            for i in 1 2 3 4 5 6 7 8; do get "http://127.0.0.1:$PORT/file.bin" "$T/con" & done; wait
+            cmp -s "$T/con" "$WEB/file.bin" && ! ls "$T" | grep -q '\.part' && echo OK6
         )"
-        for k in OK1 OK2 OK3 OK4 OK5; do grep -qx "$k" <<< "$out" || fail "$impl download helper check $k failed (OK1 good file lands intact, OK2 no .part left, OK3 a 404 fails, OK4 a failed download creates nothing, OK5 a failed download keeps the existing file): $out"; done
+        for k in OK1 OK2 OK3 OK4 OK5 OK6; do grep -qx "$k" <<< "$out" || fail "$impl download helper check $k failed (OK1 good file lands intact, OK2 no .part left, OK3 a 404 fails, OK4 a failed download creates nothing, OK5 a failed download keeps the existing file, OK6 eight concurrent downloads of one file leave it intact): $out"; done
         pass
     done
 else
     echo "NOTE: python3 or curl missing - download checks skipped"
 fi
 
-echo "PASSED - install_hang_wiring_test: $checks checks - package installs run non-interactively with stdin from /dev/null and bounded locks, iperf3's daemon question is preseeded to false, an interrupted dpkg is repaired and a stuck earlier install is stopped first, failed transactions retry per package, a saved password installs sshpass (or explains why not), SSH failures in provision_peer are reported instead of a silent exit, and downloads never leave partial or empty files"
+echo "PASSED - install_hang_wiring_test: $checks checks - package installs run non-interactively with stdin from /dev/null and bounded locks, iperf3's daemon question is preseeded to false, an interrupted dpkg is repaired and a stuck hidden earlier install is stopped first (an apt asking in an open terminal is left alone), failed transactions retry per package except on a held lock, a saved password installs sshpass (or explains why not), SSH failures in provision_peer are reported instead of a silent exit, and downloads never leave partial or empty files, even when run concurrently"

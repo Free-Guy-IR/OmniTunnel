@@ -128,13 +128,15 @@ pkg_log() { printf '%s %s\n' "$(date '+%F %T')" "$*" >>"$OMNI_PKG_LOG" 2>/dev/nu
 pkg_run() {
     local limit="$1"; shift
     pkg_log "+ $*"
+    OMNI_PKG_MARK="$(wc -c 2>/dev/null <"$OMNI_PKG_LOG" || echo 0)"
     env DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPEND=1 NEEDRESTART_MODE=l APT_LISTCHANGES_FRONTEND=none \
         timeout -k 10 "$limit" "$@" </dev/null >>"$OMNI_PKG_LOG" 2>&1
 }
 pkg_fail_hint() {
-    tail -n 12 "$OMNI_PKG_LOG" 2>/dev/null | sed 's/^/    /' || true
+    tail -n 40 "$OMNI_PKG_LOG" 2>/dev/null | uniq | tail -n 12 | sed 's/^/    /' || true
     echo "    full log: $OMNI_PKG_LOG"
 }
+pkg_log_locked() { tail -c +"$(( ${OMNI_PKG_MARK:-0} + 1 ))" "$OMNI_PKG_LOG" 2>/dev/null | grep -qiE 'could not get lock|locked by another process|unable to acquire the dpkg'; }
 dpkg_ok() { dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q 'install ok installed'; }
 stuck_debconf_pids() {
     local d a
@@ -162,16 +164,41 @@ dpkg_broken() {
     dpkg-query -W -f='${db:Status-Abbrev}\n' 2>/dev/null | grep -qE '^.[UFHWT]|^..R' && return 0
     [[ -n "$(ls -A /var/lib/dpkg/updates 2>/dev/null)" ]]
 }
+apt_owner_hidden() {
+    local p="$1" i c st out
+    for i in 1 2 3 4 5 6 7 8; do
+        [[ "$p" =~ ^[0-9]+$ && "$p" -gt 1 ]] || return 0
+        { read -r c <"/proc/$p/comm"; } 2>/dev/null || return 0
+        case "$c" in
+            apt-get|apt|aptitude)
+                out="$(readlink "/proc/$p/fd/1" 2>/dev/null)" || return 0
+                case "$out" in
+                    /dev/pts/*|/dev/tty*) [[ -e "$out" ]] && return 1; return 0;;
+                    *) return 0;;
+                esac;;
+        esac
+        st="$(cat "/proc/$p/stat" 2>/dev/null)" || return 0
+        st="${st##*) }"; st="${st#* }"; p="${st%% *}"
+    done
+    return 0
+}
 clear_stuck_install() {
-    local pids i
+    local pids p i hidden="" shown="" alive=""
     pids="$(stuck_debconf_pids 15)"
     [[ -n "$pids" ]] || return 0
-    warn "an earlier package install is stuck on a hidden question (iperf3 'start as a daemon?' or tzdata 'time zone') - stopping it (pid $(echo $pids))"
-    pkg_log "stopping stuck debconf pids: $(echo $pids)"
-    kill $pids 2>/dev/null || true
-    for i in 1 2 3 4 5; do [[ -z "$(stuck_debconf_pids 0)" ]] && break; sleep 1; done
-    pids="$(stuck_debconf_pids 0)"
-    [[ -z "$pids" ]] || kill -9 $pids 2>/dev/null || true
+    for p in $pids; do if apt_owner_hidden "$p"; then hidden+=" $p"; else shown+=" $p"; fi; done
+    [[ -z "$shown" ]] || warn "another apt is waiting for an answer in an open terminal (pid$shown) - answer it there or close it; this install waits up to 2 minutes for it"
+    [[ -n "$hidden" ]] || return 0
+    warn "an earlier package install is stuck on a hidden question (iperf3 'start as a daemon?' or tzdata 'time zone') - stopping it (pid$hidden)"
+    pkg_log "stopping stuck debconf pids:$hidden"
+    kill $hidden 2>/dev/null || true
+    for i in 1 2 3 4 5; do
+        alive=""; for p in $hidden; do kill -0 "$p" 2>/dev/null && alive+=" $p"; done
+        [[ -z "$alive" ]] && break
+        sleep 1
+    done
+    [[ -z "$alive" ]] || kill -9 $alive 2>/dev/null || true
+    [[ -n "$shown" ]] && return 0
     for i in $(seq 1 20); do dpkg_busy || break; sleep 1; done
 }
 apt_prepare() {
@@ -186,7 +213,7 @@ apt_prepare() {
     info "repairing an interrupted package install (dpkg --configure -a)..."
     for i in $(seq 1 24); do
         pkg_run 300 dpkg --force-confdef --force-confold --configure -a && return 0
-        tail -n 5 "$OMNI_PKG_LOG" 2>/dev/null | grep -qi 'lock' || break
+        pkg_log_locked || break
         sleep 5
     done
     warn "could not finish the interrupted package install (see $OMNI_PKG_LOG)"
@@ -204,6 +231,7 @@ pkg_install() {
         fi
         info "installing $* (waits up to 2 min if another apt is running)..."
         pkg_run 900 apt-get "${OMNI_APT_OPTS[@]}" install -y --no-install-recommends "$@" && return 0
+        pkg_log_locked && return 1
         for p in "$@"; do
             dpkg_ok "$p" || pkg_run 600 apt-get "${OMNI_APT_OPTS[@]}" install -y --no-install-recommends "$p" || rc=1
         done
@@ -230,9 +258,9 @@ cmd_pkg_ensure() {
     return 1
 }
 fetch_to() {
-    local part="$2.part"
-    rm -f "$part"
-    if curl "${CURL_DL[@]}" "$1" -o "$part" && [[ -s "$part" ]]; then mv -f "$part" "$2"; return 0; fi
+    local part
+    part="$(mktemp "$2.part.XXXXXX" 2>/dev/null)" || return 1
+    if curl "${CURL_DL[@]}" "$1" -o "$part" && [[ -s "$part" ]] && chmod 0644 "$part" && mv -f "$part" "$2"; then return 0; fi
     rm -f "$part"; return 1
 }
 
@@ -281,10 +309,12 @@ ensure_chisel() {
     if [[ -z "$cand" ]]; then
         info "  fetching chisel mux core for $a ..."
         mkdir -p "$ASSET_DIR/bin"
+        local cpart=""
         fetch_to "https://github.com/jpillora/chisel/releases/download/v$CHISEL_VER/chisel_${CHISEL_VER}_linux_$a.gz" "$ASSET_DIR/bin/chisel-$a.gz" \
-            && gzip -dc "$ASSET_DIR/bin/chisel-$a.gz" > "$ASSET_DIR/bin/chisel-$a.part" 2>/dev/null \
-            && [[ -s "$ASSET_DIR/bin/chisel-$a.part" ]] && mv -f "$ASSET_DIR/bin/chisel-$a.part" "$ASSET_DIR/bin/chisel-$a" \
-            || { rm -f "$ASSET_DIR/bin/chisel-$a.gz" "$ASSET_DIR/bin/chisel-$a.part"; die "could not obtain chisel-$a (no shipped copy and download failed)"; }
+            && cpart="$(mktemp "$ASSET_DIR/bin/chisel-$a.part.XXXXXX")" \
+            && gzip -dc "$ASSET_DIR/bin/chisel-$a.gz" > "$cpart" 2>/dev/null \
+            && [[ -s "$cpart" ]] && mv -f "$cpart" "$ASSET_DIR/bin/chisel-$a" \
+            || { rm -f "$ASSET_DIR/bin/chisel-$a.gz" ${cpart:+"$cpart"}; die "could not obtain chisel-$a (no shipped copy and download failed)"; }
         rm -f "$ASSET_DIR/bin/chisel-$a.gz"
         chmod +x "$ASSET_DIR/bin/chisel-$a"; cand="$ASSET_DIR/bin/chisel-$a"
     fi

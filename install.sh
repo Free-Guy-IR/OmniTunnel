@@ -46,9 +46,11 @@ pkg_log() { printf '%s %s\n' "$(date '+%F %T')" "$*" >>"$PKG_LOG" 2>/dev/null ||
 pkg_run() {
     local limit="$1"; shift
     pkg_log "+ $*"
+    PKG_MARK="$(wc -c 2>/dev/null <"$PKG_LOG" || echo 0)"
     env DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPEND=1 NEEDRESTART_MODE=l APT_LISTCHANGES_FRONTEND=none \
         timeout -k 10 "$limit" "$@" </dev/null >>"$PKG_LOG" 2>&1
 }
+pkg_log_locked() { tail -c +"$(( ${PKG_MARK:-0} + 1 ))" "$PKG_LOG" 2>/dev/null | grep -qiE 'could not get lock|locked by another process|unable to acquire the dpkg'; }
 dpkg_ok() { dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q 'install ok installed'; }
 stuck_debconf_pids() {
     local d a
@@ -76,16 +78,41 @@ dpkg_broken() {
     dpkg-query -W -f='${db:Status-Abbrev}\n' 2>/dev/null | grep -qE '^.[UFHWT]|^..R' && return 0
     [[ -n "$(ls -A /var/lib/dpkg/updates 2>/dev/null)" ]]
 }
+apt_owner_hidden() {
+    local p="$1" i c st out
+    for i in 1 2 3 4 5 6 7 8; do
+        [[ "$p" =~ ^[0-9]+$ && "$p" -gt 1 ]] || return 0
+        { read -r c <"/proc/$p/comm"; } 2>/dev/null || return 0
+        case "$c" in
+            apt-get|apt|aptitude)
+                out="$(readlink "/proc/$p/fd/1" 2>/dev/null)" || return 0
+                case "$out" in
+                    /dev/pts/*|/dev/tty*) [[ -e "$out" ]] && return 1; return 0;;
+                    *) return 0;;
+                esac;;
+        esac
+        st="$(cat "/proc/$p/stat" 2>/dev/null)" || return 0
+        st="${st##*) }"; st="${st#* }"; p="${st%% *}"
+    done
+    return 0
+}
 clear_stuck_install() {
-    local pids i
+    local pids p i hidden="" shown="" alive=""
     pids="$(stuck_debconf_pids 15)"
     [[ -n "$pids" ]] || return 0
-    echo "  an earlier package install is stuck on a hidden question (iperf3 'start as a daemon?' or tzdata 'time zone') - stopping it (pid $(echo $pids))"
-    pkg_log "stopping stuck debconf pids: $(echo $pids)"
-    kill $pids 2>/dev/null || true
-    for i in 1 2 3 4 5; do [[ -z "$(stuck_debconf_pids 0)" ]] && break; sleep 1; done
-    pids="$(stuck_debconf_pids 0)"
-    [[ -z "$pids" ]] || kill -9 $pids 2>/dev/null || true
+    for p in $pids; do if apt_owner_hidden "$p"; then hidden+=" $p"; else shown+=" $p"; fi; done
+    [[ -z "$shown" ]] || echo "  ! another apt is waiting for an answer in an open terminal (pid$shown) - answer it there or close it; this install waits up to 2 minutes for it"
+    [[ -n "$hidden" ]] || return 0
+    echo "  an earlier package install is stuck on a hidden question (iperf3 'start as a daemon?' or tzdata 'time zone') - stopping it (pid$hidden)"
+    pkg_log "stopping stuck debconf pids:$hidden"
+    kill $hidden 2>/dev/null || true
+    for i in 1 2 3 4 5; do
+        alive=""; for p in $hidden; do kill -0 "$p" 2>/dev/null && alive+=" $p"; done
+        [[ -z "$alive" ]] && break
+        sleep 1
+    done
+    [[ -z "$alive" ]] || kill -9 $alive 2>/dev/null || true
+    [[ -n "$shown" ]] && return 0
     for i in $(seq 1 20); do dpkg_busy || break; sleep 1; done
 }
 apt_prepare() {
@@ -98,7 +125,7 @@ apt_prepare() {
     echo "  repairing an interrupted package install (dpkg --configure -a)..."
     for i in $(seq 1 24); do
         pkg_run 300 dpkg --force-confdef --force-confold --configure -a && return 0
-        tail -n 5 "$PKG_LOG" 2>/dev/null | grep -qi 'lock' || break
+        pkg_log_locked || break
         sleep 5
     done
     echo "  ! could not finish the interrupted package install (see $PKG_LOG)"
@@ -109,6 +136,7 @@ apt_install() {
     pkg_run 240 apt-get "${APT_OPTS[@]}" update || echo "  ! apt-get update did not finish cleanly (a mirror may be unreachable) - trying the install anyway"
     echo "  installing: $* (waits up to 2 min if another apt is running)..."
     pkg_run 900 apt-get "${APT_OPTS[@]}" install -y --no-install-recommends "$@" && return 0
+    pkg_log_locked && return 0
     for p in "$@"; do
         dpkg_ok "$p" || pkg_run 600 apt-get "${APT_OPTS[@]}" install -y --no-install-recommends "$p" || true
     done
@@ -132,7 +160,7 @@ if [[ $missing == 1 || $repair == 1 ]]; then
     for c in "${DEPS[@]}"; do command -v "$c" >/dev/null 2>&1 || still+=" $c"; done
     if [[ -n "$still" ]]; then
         echo "  ! still missing after the install:$still"
-        tail -n 12 "$PKG_LOG" 2>/dev/null | sed 's/^/    /' || true
+        tail -n 40 "$PKG_LOG" 2>/dev/null | uniq | tail -n 12 | sed 's/^/    /' || true
         echo "    full log: $PKG_LOG"
         echo "    (iperf3 is needed only by the benchmark and sshpass only for password SSH to a foreign; the rest of OmniTunnel installs anyway)"
     fi
@@ -161,11 +189,12 @@ else
     CURL_OPTS=(-fL --connect-timeout 15 --retry 3 --retry-delay 3 --speed-limit 1024 --speed-time 60)
     if [[ -t 2 ]]; then CURL_OPTS+=(--progress-bar); else CURL_OPTS+=(-sS); fi
     fetch() {
-        local part="$2.part"
-        rm -f "$part"
-        if curl "${CURL_OPTS[@]}" "${NOCACHE[@]}" "$1" -o "$part" && [[ -s "$part" ]]; then mv -f "$part" "$2"; return 0; fi
+        local part
+        part="$(mktemp "$2.part.XXXXXX" 2>/dev/null)" || return 1
+        if curl "${CURL_OPTS[@]}" "${NOCACHE[@]}" "$1" -o "$part" && [[ -s "$part" ]] && chmod 0644 "$part" && mv -f "$part" "$2"; then return 0; fi
         rm -f "$part"; return 1
     }
+    find "$DEST" -maxdepth 2 -name '*.part.*' -mmin +60 -delete 2>/dev/null || true
     echo "  core engine (omnitun-$ARCH)"
     fetch "$RAW/bin/omnitun-$ARCH$CB" "$DEST/bin/omnitun-$ARCH.new" \
         || { echo "could not download the core from raw.githubusercontent.com (blocked or too slow from this box?) - nothing was changed"; exit 1; }
